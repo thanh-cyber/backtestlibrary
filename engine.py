@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import time
-from typing import Optional
+import inspect
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -34,6 +35,10 @@ def _time_to_minutes(t: time) -> int:
     return t.hour * 60 + t.minute
 
 
+def _time_to_seconds(t: time) -> int:
+    return t.hour * 3600 + t.minute * 60 + t.second
+
+
 def _minutes_between(start: time, end: time) -> int:
     return max(1, _time_to_minutes(end) - _time_to_minutes(start))
 
@@ -53,19 +58,22 @@ def _to_float(value) -> Optional[float]:
 
 
 def _iter_times(start: time, end: time, step_seconds: int) -> list[time]:
-    step_minutes = max(1, step_seconds // 60)
-    current = _time_to_minutes(start)
-    end_m = _time_to_minutes(end)
+    step_s = max(1, int(step_seconds))
+    current = _time_to_seconds(start)
+    end_s = _time_to_seconds(end)
     out: list[time] = []
-    while current <= end_m:
-        out.append(time(current // 60, current % 60))
-        current += step_minutes
+    while current <= end_s:
+        hh = current // 3600
+        rem = current % 3600
+        mm = rem // 60
+        ss = rem % 60
+        out.append(time(hh, mm, ss))
+        current += step_s
     return out
 
 
-def get_row_price(row: pd.Series, t: time) -> Optional[float]:
-    """Robustly read a bar price from wide time-column row."""
-    candidates = [
+def _time_candidates(t: time) -> list[object]:
+    return [
         f"{t.hour}:{t.minute:02d}",
         f"{t.hour:02d}:{t.minute:02d}",
         f"{t.hour}:{t.minute:02d}:00",
@@ -75,6 +83,11 @@ def get_row_price(row: pd.Series, t: time) -> Optional[float]:
         time(t.hour, t.minute, 0),
         time(t.hour, t.minute, 30),
     ]
+
+
+def get_row_price(row: pd.Series, t: time) -> Optional[float]:
+    """Robustly read a bar price from wide time-column row."""
+    candidates = _time_candidates(t)
     for c in candidates:
         if c in row.index:
             px = _to_float(row[c])
@@ -89,6 +102,78 @@ def get_row_price(row: pd.Series, t: time) -> Optional[float]:
             if px is not None and px > 0:
                 return px
     return None
+
+
+def _to_float_series(s: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(s):
+        return s.astype(float)
+    out = s.astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False).str.strip()
+    return pd.to_numeric(out, errors="coerce")
+
+
+def _build_day_price_cache(
+    day_df: pd.DataFrame,
+    timeline: list[time],
+) -> tuple[dict[object, pd.Series], dict[time, int], np.ndarray, Callable[[pd.Series, time], Optional[float]]]:
+    """Vectorized per-day price matrix for fast repeated lookups.
+
+    Keeps execution logic unchanged while reducing repeated column scans.
+    """
+    row_lookup = {idx: row for idx, row in day_df.iterrows()}
+    n_rows = len(day_df)
+    n_times = len(timeline)
+    matrix = np.full((n_rows, n_times), np.nan, dtype=float)
+    idx_to_pos = {idx: pos for pos, idx in enumerate(day_df.index)}
+
+    for col_pos, t in enumerate(timeline):
+        chosen_col = None
+        for cand in _time_candidates(t):
+            if cand in day_df.columns:
+                chosen_col = cand
+                break
+        if chosen_col is None:
+            # Fallback by string-equality for odd spreadsheet column types.
+            cand_str = {str(c) for c in _time_candidates(t)}
+            for col in day_df.columns:
+                col_s = str(col)
+                if col_s in cand_str or any(col_s.endswith(cs) for cs in cand_str):
+                    chosen_col = col
+                    break
+        if chosen_col is None:
+            continue
+        col_values = _to_float_series(day_df[chosen_col]).to_numpy(dtype=float, na_value=np.nan)
+        matrix[:, col_pos] = col_values
+
+    time_to_pos = {t: i for i, t in enumerate(timeline)}
+
+    def fast_get(row: pd.Series, t: time) -> Optional[float]:
+        row_pos = idx_to_pos.get(row.name)
+        t_pos = time_to_pos.get(t)
+        if row_pos is None or t_pos is None:
+            return get_row_price(row, t)
+        px = matrix[row_pos, t_pos]
+        if np.isfinite(px) and px > 0:
+            return float(px)
+        return None
+
+    return row_lookup, time_to_pos, matrix, fast_get
+
+
+def _supports_positional_args(fn, arg_count: int) -> bool:
+    """Check if callable accepts at least arg_count positional-or-keyword args."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    params = list(sig.parameters.values())
+    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params):
+        return True
+    positional = [
+        p
+        for p in params
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    return len(positional) >= arg_count
 
 
 class ChronologicalBacktestEngine:
@@ -128,18 +213,33 @@ class ChronologicalBacktestEngine:
 
         for date, df_day in daily_groups:
             timeline = _iter_times(self.config.session_start, self.config.session_end, self.config.timeline_step_seconds)
-            entries = strategy.find_entries_for_day(df_day, timeline, get_row_price) or []
+            row_lookup, _time_pos, _price_matrix, get_price = _build_day_price_cache(df_day, timeline)
+            day_context = None
+            prepare_day = getattr(strategy, "prepare_day", None)
+            if callable(prepare_day):
+                day_context = prepare_day(df_day, timeline, get_price)
+
+            find_entries = strategy.find_entries_for_day
+            entries_with_context = _supports_positional_args(find_entries, 4)
+            if entries_with_context:
+                entries = find_entries(df_day, timeline, get_price, day_context) or []
+            else:
+                entries = find_entries(df_day, timeline, get_price) or []
             entries.sort(key=lambda x: (x.entry_time.hour, x.entry_time.minute, x.entry_time.second, str(x.ticker)))
 
             entries_by_time: dict[time, list] = {}
             for e in entries:
                 entries_by_time.setdefault(e.entry_time, []).append(e)
 
+            check_exit = strategy.check_exit
+            exits_with_context = _supports_positional_args(check_exit, 5)
             open_positions: list[Position] = []
             for current_time in timeline:
                 # 1) Enter new positions in strict chronological order.
                 for entry in entries_by_time.get(current_time, []):
-                    row = df_day.loc[entry.row_index]
+                    row = row_lookup.get(entry.row_index)
+                    if row is None:
+                        continue
                     shares, entry_value = self._size_position(entry.entry_price, row, account_balance)
                     if shares <= 0 or entry_value <= 0:
                         continue
@@ -165,14 +265,19 @@ class ChronologicalBacktestEngine:
                 # 2) Evaluate exits.
                 still_open: list[Position] = []
                 for pos in open_positions:
-                    row = df_day.loc[pos.row_index]
-                    signal = strategy.check_exit(pos, row, current_time, get_row_price)
+                    row = row_lookup.get(pos.row_index)
+                    if row is None:
+                        continue
+                    if exits_with_context:
+                        signal = check_exit(pos, row, current_time, get_price, day_context)
+                    else:
+                        signal = check_exit(pos, row, current_time, get_price)
 
                     # Engine-level time exit safeguard.
                     if signal is None and current_time == self.config.session_end:
                         forced = _to_float(row.get(self.config.exit_price_col))
                         if forced is None:
-                            forced = get_row_price(row, current_time)
+                            forced = get_price(row, current_time)
                         if forced is not None and forced > 0:
                             from .bt_types import ExitSignal
 

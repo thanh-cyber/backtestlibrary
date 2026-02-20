@@ -17,11 +17,25 @@ from .bt_types import EntryCandidate, ExitSignal, Position
 class StrategyTemplate:
     """Fill in your own entry/exit logic."""
 
+    def prepare_day(
+        self,
+        day_df: pd.DataFrame,
+        timeline: list[time],
+        get_price,
+    ):
+        """Optional vectorized precompute hook called once per day.
+
+        Return any context object (arrays, masks, lookup dicts) used by
+        find_entries_for_day/check_exit for faster per-tick logic.
+        """
+        return None
+
     def find_entries_for_day(
         self,
         day_df: pd.DataFrame,
         timeline: list[time],
         get_price,
+        day_context=None,
     ) -> list[EntryCandidate]:
         candidates: list[EntryCandidate] = []
         # TODO: implement your entry scan logic.
@@ -37,6 +51,7 @@ class StrategyTemplate:
         row: pd.Series,
         current_time: time,
         get_price,
+        day_context=None,
     ) -> Optional[ExitSignal]:
         # TODO: implement stop/target/indicator/time rules.
         return None

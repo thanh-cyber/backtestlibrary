@@ -39,3 +39,13 @@ from backtestlibrary import ChronologicalBacktestEngine, BacktestConfig
 
 See `run_backbone_template.py` and `strategy_template.py`.
 
+## Performance notes
+
+- The engine keeps chronological execution semantics unchanged.
+- Under the hood, it precomputes a vectorized per-day price matrix for faster
+  repeated lookups.
+- Strategies can optionally implement `prepare_day(...)` and receive
+  `day_context` in `find_entries_for_day(..., day_context)` and
+  `check_exit(..., day_context)` for additional speedups without changing fill
+  realism.
+
