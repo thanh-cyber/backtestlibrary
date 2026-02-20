@@ -4,6 +4,12 @@ import numpy as np
 import pandas as pd
 
 
+def _res_get(res, key: str, default=None):
+    if isinstance(res, dict):
+        return res.get(key, default)
+    return getattr(res, key, default)
+
+
 def run_monte_carlo(
     results_by_year_account: dict,
     account_sizes: list[int],
@@ -28,7 +34,7 @@ def run_monte_carlo(
             res = results_by_year_account.get(year, {}).get(acct)
             if not res:
                 continue
-            t = res.get("trades")
+            t = _res_get(res, "trades")
             if t is None or t.empty or "net_pnl" not in t.columns:
                 continue
 

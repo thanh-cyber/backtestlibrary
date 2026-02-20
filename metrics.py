@@ -4,6 +4,12 @@ import numpy as np
 import pandas as pd
 
 
+def _res_get(res, key: str, default=None):
+    if isinstance(res, dict):
+        return res.get(key, default)
+    return getattr(res, key, default)
+
+
 def _profit_factor(gross_pnl_series: pd.Series) -> float:
     wins = gross_pnl_series[gross_pnl_series > 0].sum()
     losses = abs(gross_pnl_series[gross_pnl_series < 0].sum())
@@ -62,17 +68,17 @@ def build_full_metrics(
             res = results_by_year_account.get(year, {}).get(acct)
             if not res:
                 continue
-            t = res.get("trades")
+            t = _res_get(res, "trades")
             if t is None or t.empty:
                 continue
 
             start_bal = float(acct)
-            final_bal = float(res.get("final_balance", start_bal))
-            total_return = float(res.get("total_return_pct", 0.0))
-            total_pnl = float(res.get("total_pnl", final_bal - start_bal))
-            num_trades = int(res.get("total_trades", len(t)))
-            wins = int(res.get("winning_trades", 0))
-            losses = int(res.get("losing_trades", max(0, num_trades - wins)))
+            final_bal = float(_res_get(res, "final_balance", start_bal))
+            total_return = float(_res_get(res, "total_return_pct", 0.0))
+            total_pnl = float(_res_get(res, "total_pnl", final_bal - start_bal))
+            num_trades = int(_res_get(res, "total_trades", len(t)))
+            wins = int(_res_get(res, "winning_trades", 0))
+            losses = int(_res_get(res, "losing_trades", max(0, num_trades - wins)))
             win_rate = (wins / num_trades * 100.0) if num_trades else 0.0
 
             equity = np.array([start_bal] + t["account_balance_after"].tolist(), dtype=float)
