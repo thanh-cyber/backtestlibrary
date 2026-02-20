@@ -8,6 +8,14 @@ import numpy as np
 import pandas as pd
 
 
+def _normalize_ticker(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.upper().str.strip()
+
+
+def _normalize_date(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce").dt.normalize()
+
+
 def _to_numeric(series: pd.Series) -> pd.Series:
     if pd.api.types.is_numeric_dtype(series):
         return series.astype(float)
@@ -110,11 +118,10 @@ def _daily_from_wide_intraday(
     volume_time_prefixes: tuple[str, ...] = ("Vol", "Volume"),
 ) -> pd.DataFrame:
     _require_columns(wide_df, [ticker_col, date_col], "wide_df")
-    df = wide_df.copy()
-    df[ticker_col] = df[ticker_col].astype(str).str.upper().str.strip()
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
+    ticker_series = _normalize_ticker(wide_df[ticker_col])
+    date_series = _normalize_date(wide_df[date_col])
 
-    time_cols = price_time_cols or _extract_time_columns(df.columns)
+    time_cols = price_time_cols or _extract_time_columns(wide_df.columns)
     if not time_cols:
         raise ValueError("No minute price columns detected in wide_df.")
 
@@ -125,7 +132,7 @@ def _daily_from_wide_intraday(
 
     time_cols = sorted(time_cols, key=_to_dt)
 
-    price_matrix = df[time_cols].apply(_to_numeric).to_numpy(dtype=float)
+    price_matrix = wide_df[time_cols].apply(_to_numeric).to_numpy(dtype=np.float32, na_value=np.nan)
     valid_price = np.isfinite(price_matrix)
 
     # Daily OHLC approximation from one-price-per-minute series.
@@ -136,28 +143,30 @@ def _daily_from_wide_intraday(
     last_idx = np.where(valid_price.any(axis=1), valid_price.shape[1] - 1 - np.argmax(valid_price[:, ::-1], axis=1), -1)
     daily_close = np.where(
         last_idx >= 0,
-        price_matrix[np.arange(len(df)), np.clip(last_idx, 0, price_matrix.shape[1] - 1)],
+        price_matrix[np.arange(len(wide_df)), np.clip(last_idx, 0, price_matrix.shape[1] - 1)],
         np.nan,
     )
 
-    vol_map = _extract_volume_time_map(df.columns, prefixes=volume_time_prefixes)
+    vol_map = _extract_volume_time_map(wide_df.columns, prefixes=volume_time_prefixes)
     vol_cols = [vol_map[_normalize_time_label(c)] for c in time_cols if _normalize_time_label(c) in vol_map]
     if vol_cols:
-        vol_matrix = df[vol_cols].apply(_to_numeric).fillna(0.0).to_numpy(dtype=float)
+        vol_matrix = wide_df[vol_cols].apply(_to_numeric).fillna(0.0).to_numpy(dtype=np.float32)
         # align to price columns that had mapped volume
         aligned_price_cols = [c for c in time_cols if _normalize_time_label(c) in vol_map]
-        aligned_price_matrix = df[aligned_price_cols].apply(_to_numeric).to_numpy(dtype=float)
+        aligned_price_matrix = wide_df[aligned_price_cols].apply(_to_numeric).to_numpy(dtype=np.float32, na_value=np.nan)
         day_volume = vol_matrix.sum(axis=1)
         day_pv = np.nansum(aligned_price_matrix * vol_matrix, axis=1)
+        del vol_matrix, aligned_price_matrix
     else:
         # No volume columns: fallback to simple average of valid prices.
         day_volume = valid_price.sum(axis=1).astype(float)
         day_pv = np.nansum(price_matrix, axis=1)
+    del valid_price, price_matrix
 
     out = pd.DataFrame(
         {
-            "Ticker": df[ticker_col],
-            "Date": df[date_col],
+            "Ticker": ticker_series,
+            "Date": date_series,
             "DailyHigh": daily_high,
             "DailyLow": daily_low,
             "DailyClose": daily_close,
@@ -282,7 +291,11 @@ def build_daily_exit_metrics(
         raise ValueError("mode must be one of: auto, long, wide")
 
     long_ready = all(c in intraday_df.columns for c in (ticker_col, timestamp_col, high_col, low_col, close_col, volume_col))
-    wide_ready = (ticker_col in intraday_df.columns and date_col in intraday_df.columns and bool(price_time_cols or _extract_time_columns(intraday_df.columns)))
+    wide_ready = (
+        (wide_ticker_col or ticker_col) in intraday_df.columns
+        and date_col in intraday_df.columns
+        and bool(price_time_cols or _extract_time_columns(intraday_df.columns))
+    )
 
     if mode_norm == "long":
         return build_daily_exit_metrics_from_minute_bars(
@@ -343,39 +356,26 @@ def merge_exit_metrics_into_backtest_data(
     _require_columns(daily_exit_metrics, ["Ticker", "Date", "Col_ATR14", "Col_VWAP"], "daily_exit_metrics")
 
     left = backtest_df.copy()
-    left[ticker_col] = left[ticker_col].astype(str).str.upper().str.strip()
-    left[date_col] = pd.to_datetime(left[date_col], errors="coerce").dt.normalize()
-
-    right = daily_exit_metrics.copy()
-    right["Ticker"] = right["Ticker"].astype(str).str.upper().str.strip()
-    right["Date"] = pd.to_datetime(right["Date"], errors="coerce").dt.normalize()
-
-    merged = left.merge(
-        right,
-        how="left",
-        left_on=[ticker_col, date_col],
-        right_on=["Ticker", "Date"],
-        suffixes=("", "__metric"),
+    left_keys = pd.MultiIndex.from_arrays(
+        [_normalize_ticker(left[ticker_col]), _normalize_date(left[date_col])]
     )
 
+    right = daily_exit_metrics[["Ticker", "Date", "Col_ATR14", "Col_VWAP"]].copy()
+    right["Ticker"] = _normalize_ticker(right["Ticker"])
+    right["Date"] = _normalize_date(right["Date"])
+    right = right.dropna(subset=["Ticker", "Date"]).drop_duplicates(subset=["Ticker", "Date"], keep="last")
+    right = right.set_index(["Ticker", "Date"])
+
+    mapped = right.reindex(left_keys)
     for col in ("Col_ATR14", "Col_VWAP"):
-        metric_col = f"{col}__metric" if f"{col}__metric" in merged.columns else col
-        if col not in merged.columns:
-            merged[col] = merged[metric_col]
+        metric_values = mapped[col].to_numpy()
+        if col not in left.columns:
+            left[col] = metric_values
         elif overwrite:
-            merged[col] = merged[metric_col].where(merged[metric_col].notna(), merged[col])
+            left[col] = np.where(pd.notna(metric_values), metric_values, left[col])
         else:
-            merged[col] = merged[col].where(merged[col].notna(), merged[metric_col])
-
-    drop_cols = [c for c in ("Ticker", "Date", "Col_ATR14__metric", "Col_VWAP__metric") if c in merged.columns]
-    if "Ticker" in merged.columns and ticker_col == "Ticker":
-        drop_cols = [c for c in drop_cols if c != "Ticker"]
-    if "Date" in merged.columns and date_col == "Date":
-        drop_cols = [c for c in drop_cols if c != "Date"]
-    if drop_cols:
-        merged = merged.drop(columns=drop_cols)
-
-    return merged
+            left[col] = left[col].where(pd.notna(left[col]), metric_values)
+    return left
 
 
 def attach_exit_metrics_from_minute_bars(
@@ -419,7 +419,7 @@ def attach_exit_metrics_from_minute_bars(
 
 def attach_exit_metrics_from_intraday_data(
     cleaned_year_data: dict[str, pd.DataFrame],
-    intraday_df: pd.DataFrame,
+    intraday_df: pd.DataFrame | None = None,
     *,
     mode: str = "auto",
     backtest_ticker_col: str = "Ticker",
@@ -437,7 +437,38 @@ def attach_exit_metrics_from_intraday_data(
     atr_period: int = 14,
     overwrite: bool = False,
 ) -> dict[str, pd.DataFrame]:
-    """Compute Col_ATR14/Col_VWAP from long or wide intraday data and merge into each year dataframe."""
+    """Compute Col_ATR14/Col_VWAP from long or wide intraday data and merge into each year dataframe.
+
+    Memory optimization: if intraday_df is None, metrics are computed per-year
+    directly from each year's dataframe to avoid creating one large combined table.
+    """
+    out: dict[str, pd.DataFrame] = {}
+    if intraday_df is None:
+        for year, df_year in cleaned_year_data.items():
+            daily_metrics = build_daily_exit_metrics(
+                df_year,
+                mode=mode,
+                atr_period=atr_period,
+                ticker_col=minute_ticker_col,
+                date_col=wide_date_col,
+                timestamp_col=minute_timestamp_col,
+                high_col=minute_high_col,
+                low_col=minute_low_col,
+                close_col=minute_close_col,
+                volume_col=minute_volume_col,
+                wide_ticker_col=wide_ticker_col,
+                price_time_cols=wide_price_time_cols,
+                volume_time_prefixes=wide_volume_time_prefixes,
+            )
+            out[year] = merge_exit_metrics_into_backtest_data(
+                df_year,
+                daily_metrics,
+                ticker_col=backtest_ticker_col,
+                date_col=backtest_date_col,
+                overwrite=overwrite,
+            )
+        return out
+
     daily_metrics = build_daily_exit_metrics(
         intraday_df,
         mode=mode,
@@ -453,8 +484,6 @@ def attach_exit_metrics_from_intraday_data(
         price_time_cols=wide_price_time_cols,
         volume_time_prefixes=wide_volume_time_prefixes,
     )
-
-    out: dict[str, pd.DataFrame] = {}
     for year, df_year in cleaned_year_data.items():
         out[year] = merge_exit_metrics_into_backtest_data(
             df_year,
