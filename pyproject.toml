@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "backtestlibrary"
+version = "0.1.0"
+description = "Strategy-agnostic intraday backtesting backbone."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "thanh-cyber" }]
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "openpyxl>=3.1",
+]
+
+[tool.setuptools]
+packages = ["backtestlibrary"]
+
+[tool.setuptools.package-dir]
+backtestlibrary = "."

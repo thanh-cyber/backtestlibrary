@@ -2,13 +2,27 @@
 
 Reusable, strategy-agnostic backtesting backbone for consistent research runs.
 
+## Install (editable for development)
+
+```bash
+git clone https://github.com/thanh-cyber/backtestlibrary.git
+cd backtestlibrary
+pip install -e .
+```
+
+After install:
+
+```python
+from backtestlibrary import ChronologicalBacktestEngine, BacktestConfig
+```
+
 ## What is included
 
 - Data import + cleaning + cache (`data.py`)
 - Chronological execution engine (`engine.py`)
 - Full metrics output (`metrics.py`)
 - Monte Carlo stress testing (`monte_carlo.py`)
-- Strategy plug-in interface (`types.py`)
+- Strategy plug-in interface (`bt_types.py`)
 
 ## What is not included
 

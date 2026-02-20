@@ -11,7 +11,7 @@ from typing import Optional
 
 import pandas as pd
 
-from .types import EntryCandidate, ExitSignal, Position
+from .bt_types import EntryCandidate, ExitSignal, Position
 
 
 class StrategyTemplate:

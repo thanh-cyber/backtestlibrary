@@ -8,7 +8,7 @@ from .data import GapperDataLoader, LoaderConfig
 from .engine import ChronologicalBacktestEngine, BacktestConfig
 from .metrics import build_full_metrics
 from .monte_carlo import run_monte_carlo
-from .types import (
+from .bt_types import (
     EntryCandidate,
     ExitSignal,
     Position,

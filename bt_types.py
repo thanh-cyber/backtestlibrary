@@ -89,4 +89,3 @@ class Strategy(Protocol):
         get_price,
     ) -> Optional[ExitSignal]:
         """Return ExitSignal when position should be closed, else None."""
-

@@ -7,7 +7,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .types import Position, RunResult, Strategy, TradeRecord
+from .bt_types import Position, RunResult, Strategy, TradeRecord
 
 
 @dataclass
@@ -174,7 +174,7 @@ class ChronologicalBacktestEngine:
                         if forced is None:
                             forced = get_row_price(row, current_time)
                         if forced is not None and forced > 0:
-                            from .types import ExitSignal
+                            from .bt_types import ExitSignal
 
                             signal = ExitSignal(exit_price=forced, reason="Time Exit")
 
