@@ -57,6 +57,14 @@ def _to_float(value) -> Optional[float]:
     return x if np.isfinite(x) else None
 
 
+def _pl_r_for_side(side: str, entry_price: float, current_price: float, atr: float) -> float:
+    if atr <= 0:
+        return 0.0
+    if side.lower() == "short":
+        return (entry_price - current_price) / atr
+    return (current_price - entry_price) / atr
+
+
 def _iter_times(start: time, end: time, step_seconds: int) -> list[time]:
     step_s = max(1, int(step_seconds))
     current = _time_to_seconds(start)
@@ -258,6 +266,7 @@ class ChronologicalBacktestEngine:
                             stop_price=entry.stop_price,
                             target_price=entry.target_price,
                             metadata=entry.metadata,
+                            starting_account=float(starting_account),
                         )
                     )
                     available_balance -= required_margin
@@ -268,6 +277,51 @@ class ChronologicalBacktestEngine:
                     row = row_lookup.get(pos.row_index)
                     if row is None:
                         continue
+                    # ---- Update elite exit tracking every bar ----
+                    current_price = get_price(row, current_time)
+                    atr = _to_float(row.get("Col_ATR14"))
+                    if current_price is not None and current_price > 0 and atr is not None and atr > 0:
+                        current_pl_r = _pl_r_for_side(pos.side, pos.entry_price, current_price, atr)
+                        if current_pl_r > pos.mfe_r:
+                            pos.mfe_r = current_pl_r
+                            pos.bars_to_mfe = pos.bars_since_entry
+                            pos.peak_pl_r = current_pl_r
+                        if current_pl_r < pos.mae_r:
+                            pos.mae_r = current_pl_r
+                            pos.bars_to_mae = pos.bars_since_entry
+                        pos.max_dd_from_mfe = min(pos.max_dd_from_mfe, current_pl_r - pos.peak_pl_r)
+
+                        hm = f"{current_time.hour:02d}{current_time.minute:02d}"
+                        if hm == "1000":
+                            pos.unrealized_pl_1000 = current_pl_r
+                        elif hm == "1030":
+                            pos.unrealized_pl_1030 = current_pl_r
+                        elif hm == "1100":
+                            pos.unrealized_pl_1100 = current_pl_r
+                        elif hm == "1130":
+                            pos.unrealized_pl_1130 = current_pl_r
+                        elif hm == "1200":
+                            pos.unrealized_pl_1200 = current_pl_r
+                        elif hm == "1230":
+                            pos.unrealized_pl_1230 = current_pl_r
+                        elif hm == "1300":
+                            pos.unrealized_pl_1300 = current_pl_r
+                        elif hm == "1330":
+                            pos.unrealized_pl_1330 = current_pl_r
+                        elif hm == "1400":
+                            pos.unrealized_pl_1400 = current_pl_r
+                        elif hm == "1430":
+                            pos.unrealized_pl_1430 = current_pl_r
+                        elif hm == "1500":
+                            pos.unrealized_pl_1500 = current_pl_r
+                        elif hm == "1530":
+                            pos.unrealized_pl_1530 = current_pl_r
+                        elif hm == "1600":
+                            pos.unrealized_pl_1600 = current_pl_r
+
+                    # Increment bar counter once per processed bar while position is open.
+                    pos.bars_since_entry += 1
+
                     if exits_with_context:
                         signal = check_exit(pos, row, current_time, get_price, day_context)
                     else:
@@ -289,6 +343,7 @@ class ChronologicalBacktestEngine:
 
                     net_pnl, trade = self._close_trade(
                         pos=pos,
+                        row=row,
                         date=date,
                         exit_time=current_time,
                         exit_price=float(signal.exit_price),
@@ -351,6 +406,7 @@ class ChronologicalBacktestEngine:
     def _close_trade(
         self,
         pos: Position,
+        row: pd.Series,
         date: pd.Timestamp,
         exit_time: time,
         exit_price: float,
@@ -364,9 +420,12 @@ class ChronologicalBacktestEngine:
         slippage_total = entry_slippage + exit_slippage
         hold_minutes = _minutes_between(pos.entry_time, exit_time)
 
-        borrow_annual = self.config.borrow_annual_high if entry_value > 1_000_000 else self.config.borrow_annual_base
-        borrow_daily = borrow_annual / 365.0
-        borrow_cost = entry_value * borrow_daily * (hold_minutes / (24.0 * 60.0))
+        if pos.side.lower() == "short":
+            borrow_annual = self.config.borrow_annual_high if entry_value > 1_000_000 else self.config.borrow_annual_base
+            borrow_daily = borrow_annual / 365.0
+            borrow_cost = entry_value * borrow_daily * (hold_minutes / (24.0 * 60.0))
+        else:
+            borrow_cost = 0.0
         sec_taf_fee = pos.shares * self.config.sec_taf_fee_per_share
         commission_total = self.config.commission
         gst = (commission_total + sec_taf_fee) * self.config.gst_rate
@@ -397,5 +456,44 @@ class ChronologicalBacktestEngine:
             net_pnl=net_pnl,
             account_balance_after=0.0,  # set by caller after balance update
         )
+        # ---- Save elite exit analytics ----
+        trade.Col_MaxFavorableExcursion_R = float(pos.mfe_r)
+        trade.Col_DistToInitialStop_R = float(pos.mae_r)
+        trade.Col_BarsToMFE = int(pos.bars_to_mfe)
+        trade.Col_BarsToMAE = int(pos.bars_to_mae)
+        trade.Col_MaxDrawdownFromMFE_R = float(pos.max_dd_from_mfe)
+        atr = _to_float(row.get("Col_ATR14"))
+        vwap = _to_float(row.get("Col_VWAP"))
+        trade.Col_ATR14_Exit = float(atr) if atr is not None else 0.0
+        trade.Col_VWAP_Exit = float(vwap) if vwap is not None else 0.0
+        if atr is not None and atr > 0 and pos.shares != 0:
+            risk_dollar_unit = (pos.entry_price * abs(pos.shares)) / atr
+            trade.Col_FinalPL_R = float(net_pnl / risk_dollar_unit) if risk_dollar_unit > 0 else 0.0
+            if vwap is not None:
+                if pos.side.lower() == "short":
+                    trade.Col_ExitVWAPDeviation_ATR = float((vwap - exit_price) / atr)
+                else:
+                    trade.Col_ExitVWAPDeviation_ATR = float((exit_price - vwap) / atr)
+        trade.Col_HoldMinutes = int(hold_minutes)
+        trade.Col_ExitHourNumeric = float(exit_time.hour + exit_time.minute / 60.0)
+        trade.Col_BarsSinceEntry = int(pos.bars_since_entry)
+        trade.Col_PosSize_PctAccount = (
+            float((abs(pos.shares) * pos.entry_price) / pos.starting_account * 100.0)
+            if pos.starting_account > 0
+            else 0.0
+        )
+        trade.Col_UnrealizedPL_1000 = float(pos.unrealized_pl_1000)
+        trade.Col_UnrealizedPL_1030 = float(pos.unrealized_pl_1030)
+        trade.Col_UnrealizedPL_1100 = float(pos.unrealized_pl_1100)
+        trade.Col_UnrealizedPL_1130 = float(pos.unrealized_pl_1130)
+        trade.Col_UnrealizedPL_1200 = float(pos.unrealized_pl_1200)
+        trade.Col_UnrealizedPL_1230 = float(pos.unrealized_pl_1230)
+        trade.Col_UnrealizedPL_1300 = float(pos.unrealized_pl_1300)
+        trade.Col_UnrealizedPL_1330 = float(pos.unrealized_pl_1330)
+        trade.Col_UnrealizedPL_1400 = float(pos.unrealized_pl_1400)
+        trade.Col_UnrealizedPL_1430 = float(pos.unrealized_pl_1430)
+        trade.Col_UnrealizedPL_1500 = float(pos.unrealized_pl_1500)
+        trade.Col_UnrealizedPL_1530 = float(pos.unrealized_pl_1530)
+        trade.Col_UnrealizedPL_1600 = float(pos.unrealized_pl_1600)
         return net_pnl, trade
 

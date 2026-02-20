@@ -16,6 +16,7 @@ from .bt_types import (
     Strategy,
     TradeRecord,
 )
+from .io import write_trades_csv
 
 __all__ = [
     "BacktestConfig",
@@ -30,4 +31,5 @@ __all__ = [
     "TradeRecord",
     "build_full_metrics",
     "run_monte_carlo",
+    "write_trades_csv",
 ]
