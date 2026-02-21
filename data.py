@@ -248,7 +248,7 @@ class ParquetDataLoader:
 
             df[ts] = pd.to_datetime(df[ts], errors="coerce")
             df["_date"] = df[ts].dt.normalize()
-            df["_time_str"] = df[ts].apply(lambda x: f"{x.hour}:{x.minute:02d}" if pd.notna(x) else "")
+            df["_time_str"] = df[ts].dt.strftime("%H:%M")
             df = df.dropna(subset=["_date"])
             if df.empty:
                 continue
