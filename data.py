@@ -30,7 +30,8 @@ class ParquetLoaderConfig:
     cache_file: Optional[str] = None
     years: Optional[list[int]] = None
     show_progress: bool = True
-    chunk_size: int = 20  # pivot per-file, concat wide in batches to avoid OOM
+    chunk_size: int = 5  # pivot per-file, concat wide in batches; smaller = less peak memory
+    stream_to_disk: bool = True  # write batches to temp parquet, avoid holding full year in RAM
     ticker_col: str = "ticker"
     timestamp_col: str = "window_start"
     price_col: str = "close"
@@ -264,6 +265,8 @@ class ParquetDataLoader:
         out: dict[str, pd.DataFrame] = {}
 
         chunk_size = max(1, self.config.chunk_size)
+        stream_to_disk = getattr(self.config, "stream_to_disk", True)
+        import tempfile
 
         for year in sorted(year_to_paths.keys()):
             if years_filter is not None and year not in years_filter:
@@ -272,7 +275,8 @@ class ParquetDataLoader:
             iter_paths = tqdm_fn(paths, desc=f"Load {year}", unit="file") if tqdm_fn else paths
 
             wide_chunks: list[pd.DataFrame] = []
-            result: pd.DataFrame | None = None
+            temp_files: list[str] = []
+            temp_dir: str | None = None
 
             for path in iter_paths:
                 try:
@@ -314,18 +318,66 @@ class ParquetDataLoader:
                 wide_chunks.append(wide_one)
 
                 if len(wide_chunks) >= chunk_size:
-                    batch = pd.concat(wide_chunks, ignore_index=True)
+                    batch = pd.concat(wide_chunks, ignore_index=True, copy=False)
                     wide_chunks = []
-                    result = batch if result is None else pd.concat([result, batch], ignore_index=True)
-                    del batch
+                    if stream_to_disk:
+                        if temp_dir is None:
+                            temp_dir = tempfile.mkdtemp(prefix="parquet_loader_")
+                        tf = os.path.join(temp_dir, f"batch_{len(temp_files)}.parquet")
+                        batch.to_parquet(tf, index=False)
+                        temp_files.append(tf)
+                        del batch
+                    else:
+                        if not temp_files:
+                            temp_files.append(None)  # placeholder: result in memory
+                        if temp_files[0] is None:
+                            temp_files[0] = batch
+                        else:
+                            existing = temp_files[0]
+                            temp_files[0] = pd.concat([existing, batch], ignore_index=True, copy=False)
+                            del existing
+                            del batch
                     gc.collect()
 
             if wide_chunks:
-                batch = pd.concat(wide_chunks, ignore_index=True)
-                result = batch if result is None else pd.concat([result, batch], ignore_index=True)
+                batch = pd.concat(wide_chunks, ignore_index=True, copy=False)
+                if stream_to_disk and temp_dir:
+                    tf = os.path.join(temp_dir, f"batch_{len(temp_files)}.parquet")
+                    batch.to_parquet(tf, index=False)
+                    temp_files.append(tf)
+                elif not stream_to_disk:
+                    if not temp_files:
+                        temp_files = [batch]
+                    else:
+                        existing = temp_files[0]
+                        temp_files[0] = pd.concat([existing, batch], ignore_index=True, copy=False)
+                        del existing
                 del batch
+                gc.collect()
 
-            if result is None or result.empty:
+            if not temp_files:
+                continue
+
+            if stream_to_disk and temp_dir:
+                result = None
+                for f in temp_files:
+                    part = pd.read_parquet(f)
+                    result = part if result is None else pd.concat([result, part], ignore_index=True, copy=False)
+                    del part
+                    gc.collect()
+                for f in temp_files:
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(temp_dir)
+                except OSError:
+                    pass
+            else:
+                result = temp_files[0] if isinstance(temp_files[0], pd.DataFrame) else pd.read_parquet(temp_files[0])
+
+            if result.empty:
                 continue
             result = result.drop_duplicates(subset=["Ticker", "Date"], keep="last")
             out[str(year)] = result
