@@ -4,7 +4,7 @@ This package intentionally excludes strategy logic. Strategies should be
 implemented separately and plugged into the engine via the Strategy protocol.
 """
 
-from .data import GapperDataLoader, LoaderConfig
+from .data import GapperDataLoader, LoaderConfig, ParquetDataLoader, ParquetLoaderConfig
 from .engine import ChronologicalBacktestEngine, BacktestConfig
 from .metrics import build_full_metrics
 from .monte_carlo import run_monte_carlo
@@ -33,6 +33,8 @@ __all__ = [
     "ExitSignal",
     "GapperDataLoader",
     "LoaderConfig",
+    "ParquetDataLoader",
+    "ParquetLoaderConfig",
     "Position",
     "RunResult",
     "Strategy",
