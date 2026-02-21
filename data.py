@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import pickle
 import re
@@ -12,6 +13,15 @@ import numpy as np
 import pandas as pd
 
 
+def _get_tqdm():
+    """Optional tqdm for progress bars."""
+    try:
+        from tqdm.auto import tqdm
+        return tqdm
+    except ImportError:
+        return None
+
+
 @dataclass
 class ParquetLoaderConfig:
     """Config for loading parquet flat files (e.g. parquet2 folder)."""
@@ -19,6 +29,8 @@ class ParquetLoaderConfig:
     parquet_dir: str
     cache_file: Optional[str] = None
     years: Optional[list[int]] = None
+    show_progress: bool = True
+    chunk_size: int = 20  # pivot per-file, concat wide in batches to avoid OOM
     ticker_col: str = "ticker"
     timestamp_col: str = "window_start"
     price_col: str = "close"
@@ -210,13 +222,20 @@ class ParquetDataLoader:
         return found
 
     def load_cleaned_year_data(self, file_paths: Optional[list[str]] = None) -> dict[str, pd.DataFrame]:
-        files: list[str]
+        year_re = re.compile(r"\b(19|20)\d{2}\b")
+        files_with_year: list[tuple[int, str]]
         if file_paths:
-            files = [p for p in file_paths if str(p).lower().endswith(".parquet")]
+            flt = [p for p in file_paths if str(p).lower().endswith(".parquet")]
+            files_with_year = []
+            for p in flt:
+                m = year_re.search(str(p))
+                y = int(m.group(0)) if m else 0
+                files_with_year.append((y, p))
         else:
-            files = [p for _, p in self.list_parquet_files()]
+            files_with_year = self.list_parquet_files()
+
         signatures: dict[str, tuple[int, float]] = {}
-        for p in files:
+        for _, p in files_with_year:
             if os.path.exists(p):
                 signatures[p] = (os.path.getsize(p), os.path.getmtime(p))
 
@@ -229,56 +248,88 @@ class ParquetDataLoader:
         ts = self.config.timestamp_col
         pc = self.config.price_col
         vc = self.config.volume_col
-
-        parts_by_year: dict[int, list[pd.DataFrame]] = {}
         years_filter = set(self.config.years) if self.config.years else None
         required = {tc, ts, pc}
+        read_cols = [tc, ts, pc, vc]
 
-        for path in files:
-            if not os.path.exists(path):
+        year_to_paths: dict[int, list[str]] = {}
+        for y, p in files_with_year:
+            if not os.path.exists(p):
                 continue
-            try:
-                df = pd.read_parquet(path)
-            except Exception:
+            if years_filter is not None and y > 0 and y not in years_filter:
                 continue
-            if not required.issubset(df.columns):
-                continue
-            if vc not in df.columns:
-                df[vc] = 1.0
+            year_to_paths.setdefault(y, []).append(p)
 
-            df[ts] = pd.to_datetime(df[ts], errors="coerce")
-            df["_date"] = df[ts].dt.normalize()
-            df["_time_str"] = df[ts].dt.strftime("%H:%M")
-            df = df.dropna(subset=["_date"])
-            if df.empty:
-                continue
-
-            df["_year"] = df["_date"].dt.year.astype(int)
-            if years_filter is not None:
-                df = df[df["_year"].isin(years_filter)]
-            if df.empty:
-                continue
-
-            for year, grp in df.groupby("_year"):
-                parts_by_year.setdefault(int(year), []).append(grp)
-
+        tqdm_fn = _get_tqdm() if self.config.show_progress else None
         out: dict[str, pd.DataFrame] = {}
-        for year, parts in sorted(parts_by_year.items()):
-            combined = pd.concat(parts, ignore_index=True)
-            combined = combined.drop_duplicates(subset=[tc, "_date", "_time_str"], keep="last")
-            wide = _pivot_long_to_wide(
-                combined,
-                ticker_col=tc,
-                date_col="_date",
-                time_col="_time_str",
-                price_col=pc,
-                volume_col=vc,
-            )
-            if wide.empty:
+
+        chunk_size = max(1, self.config.chunk_size)
+
+        for year in sorted(year_to_paths.keys()):
+            if years_filter is not None and year not in years_filter:
                 continue
-            wide["Date"] = pd.to_datetime(wide["Date"], errors="coerce").dt.normalize()
-            wide = wide.dropna(subset=["Ticker", "Date"])
-            out[str(year)] = wide
+            paths = year_to_paths[year]
+            iter_paths = tqdm_fn(paths, desc=f"Load {year}", unit="file") if tqdm_fn else paths
+
+            wide_chunks: list[pd.DataFrame] = []
+            result: pd.DataFrame | None = None
+
+            for path in iter_paths:
+                try:
+                    df = pd.read_parquet(path, columns=read_cols)
+                except Exception:
+                    try:
+                        df = pd.read_parquet(path)
+                    except Exception:
+                        continue
+                if not required.issubset(df.columns):
+                    continue
+                if vc not in df.columns:
+                    df[vc] = 1.0
+
+                df[ts] = pd.to_datetime(df[ts], errors="coerce")
+                df["_date"] = df[ts].dt.normalize()
+                df["_time_str"] = df[ts].dt.strftime("%H:%M")
+                df = df.dropna(subset=["_date"])
+                if df.empty:
+                    continue
+                df["_year"] = df["_date"].dt.year.astype(int)
+                df = df[df["_year"] == year]
+                if df.empty:
+                    continue
+
+                wide_one = _pivot_long_to_wide(
+                    df,
+                    ticker_col=tc,
+                    date_col="_date",
+                    time_col="_time_str",
+                    price_col=pc,
+                    volume_col=vc,
+                )
+                del df
+                if wide_one.empty:
+                    continue
+                wide_one["Date"] = pd.to_datetime(wide_one["Date"], errors="coerce").dt.normalize()
+                wide_one = wide_one.dropna(subset=["Ticker", "Date"])
+                wide_chunks.append(wide_one)
+
+                if len(wide_chunks) >= chunk_size:
+                    batch = pd.concat(wide_chunks, ignore_index=True)
+                    wide_chunks = []
+                    result = batch if result is None else pd.concat([result, batch], ignore_index=True)
+                    del batch
+                    gc.collect()
+
+            if wide_chunks:
+                batch = pd.concat(wide_chunks, ignore_index=True)
+                result = batch if result is None else pd.concat([result, batch], ignore_index=True)
+                del batch
+
+            if result is None or result.empty:
+                continue
+            result = result.drop_duplicates(subset=["Ticker", "Date"], keep="last")
+            out[str(year)] = result
+            gc.collect()
 
         if self.config.cache_file and out:
             self._save_cache(signatures, out)
