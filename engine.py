@@ -260,6 +260,20 @@ class ChronologicalBacktestEngine:
                     if available_balance < required_margin:
                         continue
 
+                    stop_price = entry.stop_price
+                    if shares > 0:
+                        risk_dollars: Optional[float] = None
+                        if self.config.risk_pct_per_trade is not None and account_balance > 0:
+                            risk_dollars = account_balance * self.config.risk_pct_per_trade
+                        elif self.config.fixed_risk_per_trade is not None:
+                            risk_dollars = self.config.fixed_risk_per_trade
+                        if risk_dollars is not None and risk_dollars > 0:
+                            risk_per_share = risk_dollars / shares
+                            if entry.side.lower() == "short":
+                                stop_price = entry.entry_price + risk_per_share
+                            else:
+                                stop_price = entry.entry_price - risk_per_share
+
                     open_positions.append(
                         Position(
                             ticker=entry.ticker,
@@ -268,7 +282,7 @@ class ChronologicalBacktestEngine:
                             shares=shares,
                             entry_price=entry.entry_price,
                             entry_time=entry.entry_time,
-                            stop_price=entry.stop_price,
+                            stop_price=stop_price,
                             target_price=entry.target_price,
                             metadata=entry.metadata,
                             starting_account=float(starting_account),
