@@ -121,6 +121,7 @@ class RunResult:
     losing_trades: int
     total_pnl: float
     trades: pd.DataFrame
+    daily_equity: list[float] = field(default_factory=list)  # [start_bal, end_day1, end_day2, ...] for calendar metrics
 
 
 class Strategy(Protocol):

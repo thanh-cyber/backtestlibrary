@@ -15,9 +15,8 @@ from .bt_types import Position, RunResult, Strategy, TradeRecord
 class BacktestConfig:
     session_start: time
     session_end: time
-    fixed_position_cost: float = 100.0
-    fixed_risk_per_trade: Optional[float] = None  # If set, size by fixed $ risk per trade
-    risk_pct_per_trade: Optional[float] = None   # If set, size by % of account risk per trade (e.g. 0.05 = 5%)
+    fixed_risk_per_trade: Optional[float] = None  # Fixed $ risk per trade (e.g. 500)
+    risk_pct_per_trade: Optional[float] = None   # % of account risk per trade (e.g. 0.05 = 5%); strategy must pass stop_price
     margin_requirement: float = 1.0
     float_cap_pct: float = 0.05
     equity_cap_pct: float = 0.10
@@ -220,6 +219,7 @@ class ChronologicalBacktestEngine:
         winning_trades = 0
         losing_trades = 0
         trades_list: list[dict] = []
+        daily_equity: list[float] = [float(starting_account)]
 
         for date, df_day in daily_groups:
             timeline = _iter_times(self.config.session_start, self.config.session_end, self.config.timeline_step_seconds)
@@ -247,6 +247,8 @@ class ChronologicalBacktestEngine:
             for current_time in timeline:
                 # 1) Enter new positions in strict chronological order.
                 for entry in entries_by_time.get(current_time, []):
+                    if entry.stop_price is None:
+                        continue
                     row = row_lookup.get(entry.row_index)
                     if row is None:
                         continue
@@ -260,20 +262,6 @@ class ChronologicalBacktestEngine:
                     if available_balance < required_margin:
                         continue
 
-                    stop_price = entry.stop_price
-                    if shares > 0:
-                        risk_dollars: Optional[float] = None
-                        if self.config.risk_pct_per_trade is not None and account_balance > 0:
-                            risk_dollars = account_balance * self.config.risk_pct_per_trade
-                        elif self.config.fixed_risk_per_trade is not None:
-                            risk_dollars = self.config.fixed_risk_per_trade
-                        if risk_dollars is not None and risk_dollars > 0:
-                            risk_per_share = risk_dollars / shares
-                            if entry.side.lower() == "short":
-                                stop_price = entry.entry_price + risk_per_share
-                            else:
-                                stop_price = entry.entry_price - risk_per_share
-
                     open_positions.append(
                         Position(
                             ticker=entry.ticker,
@@ -282,7 +270,7 @@ class ChronologicalBacktestEngine:
                             shares=shares,
                             entry_price=entry.entry_price,
                             entry_time=entry.entry_time,
-                            stop_price=stop_price,
+                            stop_price=entry.stop_price,
                             target_price=entry.target_price,
                             metadata=entry.metadata,
                             starting_account=float(starting_account),
@@ -384,9 +372,8 @@ class ChronologicalBacktestEngine:
                         break
 
                 open_positions = still_open
-                if account_balance <= 0:
-                    break
 
+            daily_equity.append(account_balance)
             if account_balance <= 0:
                 break
 
@@ -402,6 +389,7 @@ class ChronologicalBacktestEngine:
             losing_trades=losing_trades,
             total_pnl=total_pnl,
             trades=trades_df,
+            daily_equity=daily_equity,
         )
 
     def _size_position(
@@ -412,18 +400,20 @@ class ChronologicalBacktestEngine:
         stop_price: Optional[float] = None,
         side: str = "long",
     ) -> tuple[int, float]:
+        """Risk-based sizing only: strategy must pass stop_price. Requires risk_pct_per_trade or fixed_risk_per_trade."""
+        if stop_price is None or entry_price <= 0:
+            return 0, 0.0
+        risk_per_share = abs(entry_price - stop_price)
+        if risk_per_share <= 0:
+            return 0, 0.0
         risk_dollars: Optional[float] = None
-        if stop_price is not None:
-            risk_per_share = abs(entry_price - stop_price)
-            if risk_per_share > 0 and entry_price > 0:
-                if self.config.risk_pct_per_trade is not None and account_balance > 0:
-                    risk_dollars = account_balance * self.config.risk_pct_per_trade
-                elif self.config.fixed_risk_per_trade is not None:
-                    risk_dollars = self.config.fixed_risk_per_trade
-                if risk_dollars is not None:
-                    shares = int(risk_dollars / risk_per_share)
-        if risk_dollars is None:
-            shares = int(self.config.fixed_position_cost / entry_price) if entry_price > 0 else 0
+        if self.config.risk_pct_per_trade is not None and account_balance > 0:
+            risk_dollars = account_balance * self.config.risk_pct_per_trade
+        elif self.config.fixed_risk_per_trade is not None:
+            risk_dollars = self.config.fixed_risk_per_trade
+        if risk_dollars is None or risk_dollars <= 0:
+            return 0, 0.0
+        shares = int(risk_dollars / risk_per_share)
         caps: list[float] = []
 
         if self.config.float_col in row.index:

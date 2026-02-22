@@ -315,6 +315,7 @@ class ParquetDataLoader:
             wide_chunks: list[pd.DataFrame] = []
             temp_files: list[str] = []
             temp_dir: str | None = None
+            accum_df: Optional[pd.DataFrame] = None
 
             for path in iter_paths:
                 try:
@@ -367,15 +368,8 @@ class ParquetDataLoader:
                         temp_files.append(tf)
                         del batch
                     else:
-                        if not temp_files:
-                            temp_files.append(None)  # placeholder: result in memory
-                        if temp_files[0] is None:
-                            temp_files[0] = batch
-                        else:
-                            existing = temp_files[0]
-                            temp_files[0] = pd.concat([existing, batch], ignore_index=True, copy=False)
-                            del existing
-                            del batch
+                        accum_df = batch if accum_df is None else pd.concat([accum_df, batch], ignore_index=True, copy=False)
+                        del batch
                     gc.collect()
 
             if wide_chunks:
@@ -386,17 +380,14 @@ class ParquetDataLoader:
                     tf = os.path.join(temp_dir, f"batch_{len(temp_files)}.parquet")
                     batch.to_parquet(tf, index=False)
                     temp_files.append(tf)
-                elif not stream_to_disk:
-                    if not temp_files:
-                        temp_files = [batch]
-                    else:
-                        existing = temp_files[0]
-                        temp_files[0] = pd.concat([existing, batch], ignore_index=True, copy=False)
-                        del existing
+                else:
+                    accum_df = batch if accum_df is None else pd.concat([accum_df, batch], ignore_index=True, copy=False)
                 del batch
                 gc.collect()
 
-            if not temp_files:
+            if stream_to_disk and not temp_files:
+                continue
+            if not stream_to_disk and accum_df is None:
                 continue
 
             if stream_to_disk and temp_dir:
@@ -416,7 +407,7 @@ class ParquetDataLoader:
                 except OSError:
                     pass
             else:
-                result = temp_files[0] if isinstance(temp_files[0], pd.DataFrame) else pd.read_parquet(temp_files[0])
+                result = accum_df
 
             if result.empty:
                 continue

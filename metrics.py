@@ -81,12 +81,17 @@ def build_full_metrics(
             losses = int(_res_get(res, "losing_trades", max(0, num_trades - wins)))
             win_rate = (wins / num_trades * 100.0) if num_trades else 0.0
 
-            equity = np.array([start_bal] + t["account_balance_after"].tolist(), dtype=float)
+            # Prefer daily_equity (calendar-day curve) for time-based metrics; fallback to trade-based for legacy
+            daily_eq = _res_get(res, "daily_equity") or []
+            if len(daily_eq) > 1:
+                equity = np.array(daily_eq, dtype=float)
+            else:
+                equity = np.array([start_bal] + t["account_balance_after"].tolist(), dtype=float)
             equity_curves[(year, acct)] = equity.tolist()
             daily_ret = pd.Series(equity).pct_change().replace([np.inf, -np.inf], np.nan).dropna()
 
             peak_arr = np.maximum.accumulate(equity)
-            dd = (equity - peak_arr) / peak_arr
+            dd = (equity - peak_arr) / np.maximum(peak_arr, 1e-15)
             max_dd = float(dd.min() * 100.0)
             avg_dd = float(dd.mean() * 100.0)
             ulcer = _ulcer_index(equity)
@@ -106,8 +111,10 @@ def build_full_metrics(
             take_pct = (take_ct / num_trades * 100.0) if num_trades else 0.0
             time_pct = (time_ct / num_trades * 100.0) if num_trades else 0.0
 
-            years_equiv = max(len(daily_ret) / 252.0, 1e-9)
-            cagr = ((final_bal / start_bal) ** (1 / years_equiv) - 1) * 100.0 if start_bal > 0 and len(daily_ret) > 1 else total_return
+            # Trading days spanned (daily_equity: [start, end_d1, ...] -> len-1 daily returns)
+            num_periods = len(daily_ret)
+            years_equiv = max(num_periods / 252.0, 1e-9)
+            cagr = ((final_bal / start_bal) ** (1 / years_equiv) - 1) * 100.0 if start_bal > 0 and num_periods >= 1 else total_return
             sharpe = _sharpe(daily_ret)
             sortino = _sortino(daily_ret)
             calmar = (cagr / 100.0) / abs(max_dd / 100.0) if max_dd != 0 else np.nan

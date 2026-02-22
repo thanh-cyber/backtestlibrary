@@ -24,7 +24,7 @@ def main() -> None:
         BacktestConfig(
             session_start=time(9, 30),
             session_end=time(16, 0),
-            fixed_position_cost=100.0,
+            risk_pct_per_trade=0.05,
         )
     )
 

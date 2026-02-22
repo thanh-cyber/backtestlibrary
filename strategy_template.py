@@ -42,7 +42,7 @@ class StrategyTemplate:
         # Example:
         # - iterate rows/tickers
         # - find first qualifying timestamp
-        # - append EntryCandidate(side='long' or 'short', stop/target optional)
+        # - append EntryCandidate(side='long' or 'short', stop_price=required, target_price optional)
         return candidates
 
     def check_exit(
