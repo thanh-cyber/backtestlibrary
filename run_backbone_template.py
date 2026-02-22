@@ -15,7 +15,7 @@ def main() -> None:
     loader = GapperDataLoader(
         LoaderConfig(
             gapper_dir=r"C:\Users\johnn\stock_data_backtest\gapper",
-            cache_file=r"C:\Users\johnn\stock_data_backtest\cache\backbone_cleaned_year_data.pkl",
+            cache_dir=r"C:\Users\johnn\stock_data_backtest\cache\backbone_cleaned_year_data",
         )
     )
     cleaned_year_data = loader.load_cleaned_year_data()
