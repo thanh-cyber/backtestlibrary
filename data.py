@@ -159,6 +159,27 @@ class GapperDataLoader:
         cache_path.write_bytes(pickle.dumps(payload))
 
 
+def _standard_minute_columns(session_start: tuple[int, int] = (9, 30), session_end: tuple[int, int] = (16, 0)) -> list[str]:
+    """Return standard minute columns for market session to prevent column explosion across files."""
+    cols = []
+    start_m = session_start[0] * 60 + session_start[1]
+    end_m = session_end[0] * 60 + session_end[1]
+    for m in range(start_m, end_m + 1):
+        h, mm = divmod(m, 60)
+        cols.append(f"{h}:{mm:02d}")
+    return cols
+
+
+def _filter_wide_to_standard_columns(wide: pd.DataFrame, standard_cols: list[str]) -> pd.DataFrame:
+    """Keep only standard minute columns; drop extras to prevent memory blowup on concat."""
+    if wide.empty:
+        return wide
+    price_cols = [c for c in standard_cols if c in wide.columns]
+    vol_cols = [f"Vol {c}" for c in standard_cols if f"Vol {c}" in wide.columns]
+    keep = ["Ticker", "Date"] + price_cols + vol_cols
+    return wide[[c for c in keep if c in wide.columns]].copy()
+
+
 def _list_parquet_files(root: Path) -> list[tuple[int, str]]:
     """Recursively find .parquet files and infer year from path when present."""
     found: list[tuple[int, str]] = []
@@ -263,6 +284,7 @@ class ParquetDataLoader:
 
         tqdm_fn = _get_tqdm() if self.config.show_progress else None
         out: dict[str, pd.DataFrame] = {}
+        standard_cols = _standard_minute_columns((9, 30), (16, 0))
 
         chunk_size = max(1, self.config.chunk_size)
         stream_to_disk = getattr(self.config, "stream_to_disk", True)
@@ -315,6 +337,7 @@ class ParquetDataLoader:
                     continue
                 wide_one["Date"] = pd.to_datetime(wide_one["Date"], errors="coerce").dt.normalize()
                 wide_one = wide_one.dropna(subset=["Ticker", "Date"])
+                wide_one = _filter_wide_to_standard_columns(wide_one, standard_cols)
                 wide_chunks.append(wide_one)
 
                 if len(wide_chunks) >= chunk_size:
