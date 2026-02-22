@@ -261,8 +261,9 @@ class ParquetDataLoader:
             if os.path.exists(p):
                 signatures[p] = (os.path.getsize(p), os.path.getmtime(p))
 
+        years_filter = set(self.config.years) if self.config.years else None
         if self.config.cache_file and signatures:
-            cached = self._try_load_cache(signatures)
+            cached = self._try_load_cache(signatures, years_filter)
             if cached is not None:
                 return cached
 
@@ -270,7 +271,6 @@ class ParquetDataLoader:
         ts = self.config.timestamp_col
         pc = self.config.price_col
         vc = self.config.volume_col
-        years_filter = set(self.config.years) if self.config.years else None
         required = {tc, ts, pc}
         read_cols = [tc, ts, pc, vc]
 
@@ -364,7 +364,9 @@ class ParquetDataLoader:
 
             if wide_chunks:
                 batch = pd.concat(wide_chunks, ignore_index=True, copy=False)
-                if stream_to_disk and temp_dir:
+                if stream_to_disk:
+                    if temp_dir is None:
+                        temp_dir = tempfile.mkdtemp(prefix="parquet_loader_")
                     tf = os.path.join(temp_dir, f"batch_{len(temp_files)}.parquet")
                     batch.to_parquet(tf, index=False)
                     temp_files.append(tf)
@@ -404,27 +406,67 @@ class ParquetDataLoader:
                 continue
             result = result.drop_duplicates(subset=["Ticker", "Date"], keep="last")
             out[str(year)] = result
+            # Write year to disk as we go (streams to parquet; avoids holding all years in memory)
+            if self.config.cache_file:
+                cache_dir = self._cache_dir()
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                result.to_parquet(cache_dir / f"{year}.parquet", index=False)
             gc.collect()
 
-        if self.config.cache_file and out:
-            self._save_cache(signatures, out)
+        # Only save cache when all requested years succeeded (avoid partial cache)
+        requested = {str(y) for y in year_to_paths.keys()}
+        if self.config.cache_file and out and set(out.keys()) == requested:
+            self._save_cache_meta(signatures, list(out.keys()), years_filter)
         return out
 
-    def _try_load_cache(self, signatures: dict[str, tuple[int, float]]) -> Optional[dict[str, pd.DataFrame]]:
-        cache_path = Path(self.config.cache_file)
-        if not cache_path.exists():
+    def _cache_dir(self) -> Path:
+        """Directory for parquet cache (one file per year); derived from cache_file."""
+        p = Path(self.config.cache_file)
+        # e.g. cache/backbone_cleaned_year_data_parquet.pkl -> cache/backbone_cleaned_year_data_parquet/
+        stem = p.stem if p.suffix else p.name
+        return p.parent / stem
+
+    def _try_load_cache(
+        self, signatures: dict[str, tuple[int, float]], years_filter: Optional[set[int]]
+    ) -> Optional[dict[str, pd.DataFrame]]:
+        cache_dir = self._cache_dir()
+        meta_path = cache_dir / "_meta.pkl"
+        if not meta_path.exists():
             return None
         try:
-            payload = pickle.loads(cache_path.read_bytes())
-            if payload.get("signatures") == signatures:
-                return payload.get("data", {})
+            with open(meta_path, "rb") as f:
+                meta = pickle.load(f)
+            if meta.get("signatures") != signatures:
+                return None
+            # Cache invalid if years filter changed (e.g. ran [2022], now [2022,2023])
+            want = frozenset(years_filter) if years_filter is not None else None
+            got = meta.get("years_filter")
+            got_fs = frozenset(got) if got is not None else None
+            if want != got_fs:
+                return None
+            expected_years = meta.get("years", [])
+            out: dict[str, pd.DataFrame] = {}
+            for year in expected_years:
+                fp = cache_dir / f"{year}.parquet"
+                if fp.exists():
+                    out[str(year)] = pd.read_parquet(fp)
+            # Only use cache if all expected files present (avoid partial/corrupt cache)
+            if len(out) != len(expected_years):
+                return None
+            return out
         except Exception:
             return None
-        return None
 
-    def _save_cache(self, signatures: dict[str, tuple[int, float]], data: dict[str, pd.DataFrame]) -> None:
-        cache_path = Path(self.config.cache_file)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"signatures": signatures, "data": data}
-        cache_path.write_bytes(pickle.dumps(payload))
+    def _save_cache_meta(
+        self,
+        signatures: dict[str, tuple[int, float]],
+        years: list[str],
+        years_filter: Optional[set[int]],
+    ) -> None:
+        """Save cache metadata (parquet files written in loop)."""
+        cache_dir = self._cache_dir()
+        yf = sorted(years_filter) if years_filter is not None else None
+        meta = {"signatures": signatures, "years": years, "years_filter": yf}
+        with open(cache_dir / "_meta.pkl", "wb") as f:
+            pickle.dump(meta, f, protocol=pickle.HIGHEST_PROTOCOL)
 
