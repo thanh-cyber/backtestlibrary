@@ -6,7 +6,7 @@ implemented separately and plugged into the engine via the Strategy protocol.
 
 from .data import GapperDataLoader, LoaderConfig, ParquetDataLoader, ParquetLoaderConfig
 from .engine import ChronologicalBacktestEngine, BacktestConfig
-from .metrics import build_full_metrics
+from .analyzers import build_full_metrics
 from .monte_carlo import run_monte_carlo
 from .exit_metrics import (
     attach_exit_metrics_from_intraday_data,
@@ -17,6 +17,7 @@ from .exit_metrics import (
     merge_exit_metrics_into_backtest_data,
 )
 from .bt_types import (
+    Analyzer,
     EntryCandidate,
     ExitSignal,
     Position,
@@ -24,10 +25,13 @@ from .bt_types import (
     Strategy,
     TradeRecord,
 )
+from .analyzers import DEFAULT_ANALYZERS
 from .io import write_trades_csv
 
 __all__ = [
+    "Analyzer",
     "BacktestConfig",
+    "DEFAULT_ANALYZERS",
     "ChronologicalBacktestEngine",
     "EntryCandidate",
     "ExitSignal",

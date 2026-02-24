@@ -1,29 +1,29 @@
-"""Unit and regression tests for metrics module."""
+"""Unit and regression tests for metrics (build_full_metrics and helpers in analyzers)."""
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from backtestlibrary import metrics
+from backtestlibrary.analyzers import _sharpe, _sortino, build_full_metrics
 
 
 class TestSharpe:
     """Unit tests for _sharpe."""
 
     def test_empty_returns_nan(self):
-        assert np.isnan(metrics._sharpe(pd.Series(dtype=float)))
+        assert np.isnan(_sharpe(pd.Series(dtype=float)))
 
     def test_single_value_nan(self):
-        assert np.isnan(metrics._sharpe(pd.Series([0.01])))
+        assert np.isnan(_sharpe(pd.Series([0.01])))
 
     def test_positive_returns_positive_sharpe(self):
         ret = pd.Series([0.01, -0.005, 0.02, 0.0])
-        s = metrics._sharpe(ret)
+        s = _sharpe(ret)
         assert s > 0
 
     def test_zero_std_nan(self):
         ret = pd.Series([0.01, 0.01, 0.01])
-        s = metrics._sharpe(ret)
+        s = _sharpe(ret)
         assert np.isnan(s)
 
 
@@ -31,17 +31,17 @@ class TestSortino:
     """Unit tests for _sortino."""
 
     def test_empty_returns_nan(self):
-        assert np.isnan(metrics._sortino(pd.Series(dtype=float)))
+        assert np.isnan(_sortino(pd.Series(dtype=float)))
 
     def test_single_value_nan(self):
-        assert np.isnan(metrics._sortino(pd.Series([0.01])))
+        assert np.isnan(_sortino(pd.Series([0.01])))
 
 
 class TestBuildFullMetrics:
     """Unit tests for build_full_metrics."""
 
     def test_empty_results_returns_empty_df(self):
-        df, curves = metrics.build_full_metrics({}, [100_000])
+        df, curves = build_full_metrics({}, [100_000])
         assert df.empty
         assert curves == {}
 
@@ -65,7 +65,7 @@ class TestBuildFullMetrics:
                 }
             }
         }
-        df, curves = metrics.build_full_metrics(res, [100_000])
+        df, curves = build_full_metrics(res, [100_000])
         assert not df.empty
         assert ("2022", 100_000) in curves
 

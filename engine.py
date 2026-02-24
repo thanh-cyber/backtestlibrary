@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .bt_types import Position, RunResult, Strategy, TradeRecord
+from .analyzers import build_full_metrics
 
 
 @dataclass
@@ -188,15 +189,17 @@ def _supports_positional_args(fn, arg_count: int) -> bool:
 class ChronologicalBacktestEngine:
     """Chronological engine with pluggable entry/exit strategy callbacks."""
 
-    def __init__(self, config: BacktestConfig):
+    def __init__(self, config: BacktestConfig, analyzers=None):
         self.config = config
+        self.analyzers = analyzers or []
 
     def run(
         self,
         cleaned_year_data: dict[str, pd.DataFrame],
         strategy: Strategy,
         starting_accounts: list[int],
-    ) -> dict[str, dict[int, RunResult]]:
+    ) -> tuple[dict[str, dict[int, RunResult]], pd.DataFrame, dict[tuple[str, int], list[float]]]:
+        """Run backtest per year/account; returns (results, metrics_df, equity_curves)."""
         results: dict[str, dict[int, RunResult]] = {}
 
         for year, df_year in cleaned_year_data.items():
@@ -210,7 +213,9 @@ class ChronologicalBacktestEngine:
             for starting_account in starting_accounts:
                 run_result = self._run_single_account(daily_groups, starting_account, strategy)
                 results[year][starting_account] = run_result
-        return results
+
+        metrics_df, equity_curves = build_full_metrics(results, starting_accounts)
+        return results, metrics_df, equity_curves
 
     def _run_single_account(self, daily_groups, starting_account: int, strategy: Strategy) -> RunResult:
         account_balance = float(starting_account)
@@ -381,7 +386,7 @@ class ChronologicalBacktestEngine:
         total_pnl = final_balance - float(starting_account)
         total_return_pct = (total_pnl / float(starting_account) * 100.0) if starting_account > 0 else 0.0
         trades_df = pd.DataFrame(trades_list) if trades_list else pd.DataFrame()
-        return RunResult(
+        result = RunResult(
             final_balance=final_balance,
             total_return_pct=total_return_pct,
             total_trades=total_trades,
@@ -391,6 +396,10 @@ class ChronologicalBacktestEngine:
             trades=trades_df,
             daily_equity=daily_equity,
         )
+        for analyzer in self.analyzers:
+            name = analyzer.__class__.__name__.replace("Analyzer", "")
+            result.analyzers[name] = analyzer.analyze(result)
+        return result
 
     def _size_position(
         self,

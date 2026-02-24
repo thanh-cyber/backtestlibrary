@@ -94,7 +94,7 @@ class TestEngineIntegration:
             risk_pct_per_trade=0.05,
         )
         engine = ChronologicalBacktestEngine(cfg)
-        results = engine.run(
+        results, _metrics_df, _curves = engine.run(
             sample_cleaned_year_data,
             strategy_one_entry_with_stop,
             starting_accounts=[100_000],
@@ -111,6 +111,11 @@ class TestEngineIntegration:
         assert isinstance(r.daily_equity, list)
         # daily_equity: [start_bal, end_day1, ...]
         assert len(r.daily_equity) >= 1
+        # Engine returns (results, metrics_df, equity_curves)
+        assert isinstance(_metrics_df, pd.DataFrame)
+        assert len(_metrics_df) >= 1
+        assert ("2022", 100_000) in _curves
+        assert len(_curves[("2022", 100_000)]) == len(r.daily_equity)
 
     def test_entries_without_stop_price_skipped(self, sample_cleaned_year_data):
         """Entries with stop_price=None are skipped."""
@@ -141,7 +146,7 @@ class TestEngineIntegration:
 
         cfg = BacktestConfig(session_start=time(9, 30), session_end=time(16, 0), risk_pct_per_trade=0.05)
         engine = ChronologicalBacktestEngine(cfg)
-        results = engine.run(sample_cleaned_year_data, S(), [100_000])
+        results, _, _ = engine.run(sample_cleaned_year_data, S(), [100_000])
         r = results["2022"][100_000]
         assert r.total_trades == 0
         assert r.trades.empty
@@ -156,7 +161,7 @@ class TestEngineIntegration:
             risk_pct_per_trade=0.05,
         )
         engine = ChronologicalBacktestEngine(cfg)
-        results = engine.run(
+        results, _metrics_df, _curves = engine.run(
             sample_cleaned_year_data,
             strategy_one_entry_with_stop,
             starting_accounts=[100_000],
