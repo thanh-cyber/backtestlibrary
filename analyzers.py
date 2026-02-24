@@ -257,6 +257,10 @@ def build_full_metrics(
 
             if isinstance(res, RunResult):
                 run_result = res
+                # Use pre-computed FullMetrics when available (engine already ran analyzers)
+                row = None
+                if res.analyzers and "FullMetrics" in res.analyzers:
+                    row = dict(res.analyzers["FullMetrics"])
             else:
                 start_bal = float(acct)
                 final_bal = float(_res_get(res, "final_balance", start_bal))
@@ -272,7 +276,9 @@ def build_full_metrics(
                     trades=t,
                     daily_equity=daily_eq if len(daily_eq) > 1 else [start_bal] + t["account_balance_after"].tolist(),
                 )
-            row = full_analyzer.analyze(run_result)
+                row = None
+            if row is None:
+                row = full_analyzer.analyze(run_result)
             if not row:
                 continue
             row["year"] = year

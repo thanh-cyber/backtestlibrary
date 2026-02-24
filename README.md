@@ -20,7 +20,7 @@ from backtestlibrary import ChronologicalBacktestEngine, BacktestConfig
 
 - Data import + cleaning + cache (`data.py`)
 - Chronological execution engine (`engine.py`)
-- Full metrics output (`metrics.py`)
+- Modular analyzers + full metrics (`analyzers.py`)
 - Monte Carlo stress testing (`monte_carlo.py`)
 - Strategy plug-in interface (`bt_types.py`)
 
@@ -33,11 +33,33 @@ from backtestlibrary import ChronologicalBacktestEngine, BacktestConfig
 1. Implement your strategy class using `find_entries_for_day()` and `check_exit()`
 2. Load data with `GapperDataLoader`
 3. Run engine with `ChronologicalBacktestEngine`
-4. Generate standardized outputs with:
-   - `build_full_metrics()`
-   - `run_monte_carlo()`
+4. Use the returned `(results, metrics_df, equity_curves)` and/or `run_monte_carlo()`
 
 See `run_backbone_template.py` and `strategy_template.py`.
+
+### Engine output
+
+`engine.run(cleaned_year_data, strategy, starting_accounts)` returns a 3-tuple:
+
+```python
+results, metrics_df, equity_curves = engine.run(cleaned_year_data, strategy, starting_accounts)
+# results       → dict[year][account] = RunResult
+# metrics_df    → full metrics table (one row per year/account)
+# equity_curves → dict[(year, account)] = list of daily equity values
+```
+
+### Per-run modular analyzers
+
+Each `RunResult` has `result.analyzers` populated by the engine (when using `DEFAULT_ANALYZERS` or a custom analyzer list):
+
+```python
+result = results["2025"][100_000]
+print(result.analyzers["FullMetrics"])   # full metrics dict for this run
+print(result.analyzers["SQN"])
+print(result.analyzers["DrawdownDuration"])
+```
+
+You can still call `build_full_metrics(results, starting_accounts)` yourself if you have results from another source; the engine now computes it automatically and returns it as the second element of the tuple.
 
 ## Performance notes
 
