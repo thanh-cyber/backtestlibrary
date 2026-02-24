@@ -17,6 +17,10 @@ dependencies = [
   "pytest>=7.0",
 ]
 
+[project.optional-dependencies]
+plot = ["matplotlib>=3.6"]
+librarycolumn = ["librarycolumn>=0.1.0"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

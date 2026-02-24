@@ -19,6 +19,7 @@ from backtestlibrary import ChronologicalBacktestEngine, BacktestConfig
 ## What is included
 
 - Data import + cleaning + cache (`data.py`)
+- **Flexible Pandas data feed + resampling** (`feed.py`) — validate/normalize any DataFrame to the engine contract; resample wide intraday bars (e.g. 1m → 5m)
 - Chronological execution engine (`engine.py`)
 - Modular analyzers + full metrics (`analyzers.py`)
 - Monte Carlo stress testing (`monte_carlo.py`)
@@ -60,6 +61,39 @@ print(result.analyzers["DrawdownDuration"])
 ```
 
 You can still call `build_full_metrics(results, starting_accounts)` yourself if you have results from another source; the engine now computes it automatically and returns it as the second element of the tuple.
+
+### Flexible Pandas data feed
+
+Any DataFrame (or dict of DataFrames by year) that has **Date**, **Ticker**, and at least one **time column** (e.g. `9:30`, `9:31`) can be validated, normalized, and passed to the engine:
+
+```python
+from backtestlibrary import PandasDataFeed, DataFeedConfig, validate_feed, normalize_feed
+
+# Single DataFrame or dict[str, DataFrame]
+feed = PandasDataFeed(my_df, config=DataFeedConfig(session_start=(9, 30), session_end=(16, 0)))
+cleaned_year_data = feed.to_cleaned_year_data()
+results, metrics_df, equity_curves = engine.run(cleaned_year_data, strategy, starting_accounts)
+```
+
+Use `validate_feed(df)` to check contract; `normalize_feed(df)` to normalize dates and tickers.
+
+### Resampling
+
+Resample wide-format minute bars to a coarser timeframe (e.g. 5m) so the engine runs on fewer bars. Use `timeline_step_seconds = rule_minutes * 60` in `BacktestConfig` when running on resampled data:
+
+```python
+from backtestlibrary import resample_wide_intraday, PandasDataFeed, DataFeedConfig
+
+# Option A: resample when building the feed
+feed = PandasDataFeed(data, config=DataFeedConfig(resample_minutes=5))
+cleaned_year_data = feed.to_cleaned_year_data()
+
+# Option B: resample a DataFrame directly
+resampled_df = resample_wide_intraday(wide_df, rule_minutes=5, session_start=(9, 30), session_end=(16, 0))
+
+# Run engine with 5m step
+config = BacktestConfig(..., timeline_step_seconds=300)  # 5 * 60
+```
 
 ## Performance notes
 

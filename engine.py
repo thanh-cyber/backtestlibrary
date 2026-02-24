@@ -3,13 +3,15 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import time
 import inspect
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
 
 from .bt_types import Position, RunResult, Strategy, TradeRecord
 from .analyzers import build_full_metrics
+from .sizers import RiskSizer
+from .columns import apply_entry_columns, apply_exit_columns
 
 
 @dataclass
@@ -17,8 +19,9 @@ class BacktestConfig:
     session_start: time
     session_end: time
     fixed_risk_per_trade: Optional[float] = None  # Fixed $ risk per trade (e.g. 500)
-    risk_pct_per_trade: Optional[float] = None   # % of account risk per trade (e.g. 0.05 = 5%); strategy must pass stop_price
+    risk_pct_per_trade: Optional[float] = None   # % of account risk per trade (e.g. 0.05 = 5%); used by RiskSizer
     margin_requirement: float = 1.0
+    sizer: Optional[Any] = None  # Pluggable sizer (FixedSizeSizer, PercentOfEquitySizer, RiskSizer, KellySizer). If None, uses RiskSizer(config).
     float_cap_pct: float = 0.05
     equity_cap_pct: float = 0.10
     absolute_cap_value: float = 1_000_000.0
@@ -31,6 +34,7 @@ class BacktestConfig:
     timeline_step_seconds: int = 60
     float_col: str = "Float_Numeric"
     exit_price_col: str = "Exit_Price"
+    use_library_columns: bool = False  # When True, engine runs entry/exit columns from librarycolumn at entry/exit time; default off
 
 
 def _time_to_minutes(t: time) -> int:
@@ -192,6 +196,7 @@ class ChronologicalBacktestEngine:
     def __init__(self, config: BacktestConfig, analyzers=None):
         self.config = config
         self.analyzers = analyzers or []
+        self.sizer = config.sizer if config.sizer is not None else RiskSizer()
 
     def run(
         self,
@@ -252,8 +257,6 @@ class ChronologicalBacktestEngine:
             for current_time in timeline:
                 # 1) Enter new positions in strict chronological order.
                 for entry in entries_by_time.get(current_time, []):
-                    if entry.stop_price is None:
-                        continue
                     row = row_lookup.get(entry.row_index)
                     if row is None:
                         continue
@@ -267,6 +270,11 @@ class ChronologicalBacktestEngine:
                     if available_balance < required_margin:
                         continue
 
+                    entry_column_snapshot: Optional[dict] = None
+                    if self.config.use_library_columns:
+                        entry_column_snapshot = {}
+                        apply_entry_columns(entry_column_snapshot, row)
+
                     open_positions.append(
                         Position(
                             ticker=entry.ticker,
@@ -279,15 +287,17 @@ class ChronologicalBacktestEngine:
                             target_price=entry.target_price,
                             metadata=entry.metadata,
                             starting_account=float(starting_account),
+                            entry_column_snapshot=entry_column_snapshot,
                         )
                     )
                     available_balance -= required_margin
 
                 # 2) Evaluate exits.
                 still_open: list[Position] = []
-                for pos in open_positions:
+                for i, pos in enumerate(open_positions):
                     row = row_lookup.get(pos.row_index)
                     if row is None:
+                        still_open.append(pos)
                         continue
                     # ---- Update elite exit tracking every bar ----
                     current_price = get_price(row, current_time)
@@ -371,9 +381,15 @@ class ChronologicalBacktestEngine:
                     available_balance += pos.shares * pos.entry_price * self.config.margin_requirement + net_pnl
                     available_balance = max(0.0, available_balance)
                     trade.account_balance_after = account_balance
-                    trades_list.append(asdict(trade))
+                    tdict = asdict(trade)
+                    if self.config.use_library_columns:
+                        if pos.entry_column_snapshot:
+                            tdict.update(pos.entry_column_snapshot)
+                        apply_exit_columns(tdict, row)
+                    trades_list.append(tdict)
 
                     if account_balance <= 0:
+                        still_open.extend(open_positions[i + 1 :])
                         break
 
                 open_positions = still_open
@@ -409,20 +425,14 @@ class ChronologicalBacktestEngine:
         stop_price: Optional[float] = None,
         side: str = "long",
     ) -> tuple[int, float]:
-        """Risk-based sizing only: strategy must pass stop_price. Requires risk_pct_per_trade or fixed_risk_per_trade."""
-        if stop_price is None or entry_price <= 0:
+        """Use configured sizer to get raw size, then apply float/equity/absolute caps."""
+        if entry_price is None or not np.isfinite(entry_price) or entry_price <= 0:
             return 0, 0.0
-        risk_per_share = abs(entry_price - stop_price)
-        if risk_per_share <= 0:
+        shares, _ = self.sizer.size(
+            entry_price, row, account_balance, stop_price, side, self.config
+        )
+        if shares <= 0:
             return 0, 0.0
-        risk_dollars: Optional[float] = None
-        if self.config.risk_pct_per_trade is not None and account_balance > 0:
-            risk_dollars = account_balance * self.config.risk_pct_per_trade
-        elif self.config.fixed_risk_per_trade is not None:
-            risk_dollars = self.config.fixed_risk_per_trade
-        if risk_dollars is None or risk_dollars <= 0:
-            return 0, 0.0
-        shares = int(risk_dollars / risk_per_share)
         caps: list[float] = []
 
         if self.config.float_col in row.index:
@@ -437,7 +447,7 @@ class ChronologicalBacktestEngine:
         if caps:
             shares = min(shares, *caps)
         shares = int(max(0, shares))
-        return shares, shares * entry_price
+        return shares, float(shares * entry_price)
 
     def _close_trade(
         self,

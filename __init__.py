@@ -22,15 +22,39 @@ from .bt_types import (
     ExitSignal,
     Position,
     RunResult,
+    Sizer,
+    SizerConfig,
     Strategy,
     TradeRecord,
 )
+from .sizers import FixedSizeSizer, KellySizer, PercentOfEquitySizer, RiskSizer
 from .analyzers import DEFAULT_ANALYZERS
-from .io import write_trades_csv
+from .feed import (
+    DataFeedConfig,
+    PandasDataFeed,
+    REQUIRED_FEED_COLUMNS,
+    normalize_feed,
+    resample_wide_intraday,
+    validate_feed,
+)
+from .io import write_trades_csv, write_trades_excel
+from .plotting import plot_equity_drawdown, plot_result, plot_trade_pnl
+from .columns import (
+    apply_exit_columns,
+    attach_continuous_tracking,
+    get_entry_columns,
+    get_exit_columns,
+    get_continuous_columns,
+    has_librarycolumn,
+)
 
 __all__ = [
     "Analyzer",
     "BacktestConfig",
+    "FixedSizeSizer",
+    "KellySizer",
+    "PercentOfEquitySizer",
+    "RiskSizer",
     "DEFAULT_ANALYZERS",
     "ChronologicalBacktestEngine",
     "EntryCandidate",
@@ -41,6 +65,8 @@ __all__ = [
     "ParquetLoaderConfig",
     "Position",
     "RunResult",
+    "Sizer",
+    "SizerConfig",
     "Strategy",
     "TradeRecord",
     "build_full_metrics",
@@ -52,4 +78,20 @@ __all__ = [
     "attach_exit_metrics_from_minute_bars",
     "attach_exit_metrics_from_intraday_data",
     "write_trades_csv",
+    "write_trades_excel",
+    "DataFeedConfig",
+    "PandasDataFeed",
+    "REQUIRED_FEED_COLUMNS",
+    "normalize_feed",
+    "resample_wide_intraday",
+    "validate_feed",
+    "plot_result",
+    "plot_equity_drawdown",
+    "plot_trade_pnl",
+    "apply_exit_columns",
+    "attach_continuous_tracking",
+    "get_entry_columns",
+    "get_exit_columns",
+    "get_continuous_columns",
+    "has_librarycolumn",
 ]

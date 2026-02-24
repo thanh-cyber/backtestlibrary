@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import time
-from typing import Any, Optional, Protocol
+from typing import Any, Dict, Optional, Protocol
 
 import pandas as pd
 
@@ -58,6 +58,7 @@ class Position:
     unrealized_pl_1500: float = 0.0
     unrealized_pl_1530: float = 0.0
     unrealized_pl_1600: float = 0.0
+    entry_column_snapshot: Optional[dict] = None  # Entry_Col_* from librarycolumn, captured at entry time when use_library_columns is True
 
 
 @dataclass
@@ -122,6 +123,42 @@ class RunResult:
     total_pnl: float
     trades: pd.DataFrame
     daily_equity: list[float] = field(default_factory=list)  # [start_bal, end_day1, end_day2, ...] for calendar metrics
+    analyzers: Dict[str, Any] = field(default_factory=dict)  # modular analyzer outputs: name -> result
+
+
+class Analyzer(Protocol):
+    """Base for all analyzers. Drop-in, zero core changes."""
+
+    def analyze(self, result: RunResult) -> Any:
+        """Return anything (dict, DF, float, object)."""
+        ...
+
+
+class SizerConfig(Protocol):
+    """Minimal config needed by sizers; satisfied by BacktestConfig."""
+
+    risk_pct_per_trade: Optional[float]
+    fixed_risk_per_trade: Optional[float]
+    float_col: str
+    float_cap_pct: float
+    equity_cap_pct: float
+    absolute_cap_value: float
+
+
+class Sizer(Protocol):
+    """Pluggable position sizer (backtrader-style). Returns (shares, entry_value); engine applies caps."""
+
+    def size(
+        self,
+        entry_price: float,
+        row: pd.Series,
+        account_balance: float,
+        stop_price: Optional[float],
+        side: str,
+        config: SizerConfig,
+    ) -> tuple[int, float]:
+        """Return (shares, entry_value). Engine will apply float/equity/absolute caps."""
+        ...
 
 
 class Strategy(Protocol):

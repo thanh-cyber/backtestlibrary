@@ -1,20 +1,60 @@
 """I/O utilities for backtest outputs."""
 
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
+
+import pandas as pd
 
 from .bt_types import RunResult
 
 
-def write_trades_csv(result: RunResult, path: Union[str, Path]) -> None:
-    """Write backtest trades to CSV, including all exit columns.
+def write_trades_csv(
+    result: RunResult,
+    path: Union[str, Path],
+    *,
+    enriched_long_df: Optional[pd.DataFrame] = None,
+) -> None:
+    """Write backtest trades to CSV with Entry, Exit, and optionally Continuous columns.
+
+    Columns are labelled: Entry_Col_X (entry snapshot), Col_X_Exit (exit snapshot),
+    Cont_Col_X_Entry/Exit/Max/Min/At30min/At60min (continuous, only if enriched_long_df provided).
 
     Args:
-        result: RunResult from ChronologicalBacktestEngine (trades attribute
-                includes core fields plus Col_MaxFavorableExcursion_R,
-                Col_DistToInitialStop_R, Col_ATR14_Exit, Col_VWAP_Exit, etc.).
+        result: RunResult from ChronologicalBacktestEngine.
         path: Output file path (e.g. "trades.csv" or Path("backtest_results/trades.csv")).
+        enriched_long_df: Optional minute-level long DataFrame with Ticker, datetime and Col_*.
+                          If provided, runs attach_continuous_tracking so CSV includes Cont_* columns.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    result.trades.to_csv(path, index=False, date_format="%Y-%m-%d %H:%M:%S")
+    to_write = result.trades if result.trades is not None else pd.DataFrame()
+    if enriched_long_df is not None and not enriched_long_df.empty:
+        from .columns import attach_continuous_tracking
+        result = attach_continuous_tracking(result, enriched_long_df)
+        to_write = result.trades
+    to_write.to_csv(path, index=False, date_format="%Y-%m-%d %H:%M:%S")
+
+
+def write_trades_excel(
+    result: RunResult,
+    path: Union[str, Path],
+    *,
+    enriched_long_df: Optional[pd.DataFrame] = None,
+) -> None:
+    """Write backtest trades to Excel with Entry, Exit, and optionally Continuous columns.
+
+    Same column labelling as write_trades_csv: Entry_Col_X, Col_X_Exit, Cont_Col_X_*.
+
+    Args:
+        result: RunResult from ChronologicalBacktestEngine.
+        path: Output file path (e.g. "trades.xlsx").
+        enriched_long_df: Optional minute-level long DataFrame; if provided, adds Cont_* columns.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    to_write = result.trades if result.trades is not None else pd.DataFrame()
+    if enriched_long_df is not None and not enriched_long_df.empty:
+        from .columns import attach_continuous_tracking
+        result = attach_continuous_tracking(result, enriched_long_df)
+        to_write = result.trades
+    to_write.to_excel(path, index=False, engine="openpyxl")

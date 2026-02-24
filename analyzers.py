@@ -114,7 +114,11 @@ class FullMetricsAnalyzer(Analyzer):
         sharpe = _sharpe(daily_ret)
         sortino = _sortino(daily_ret)
         calmar = (cagr / 100.0) / abs(max_dd / 100.0) if max_dd != 0 else np.nan
-        recovery_factor = total_pnl / abs(max_dd * start_bal / 100.0) if max_dd != 0 else np.nan
+        recovery_factor = (
+            total_pnl / abs(max_dd * start_bal / 100.0)
+            if max_dd != 0 and start_bal != 0
+            else np.nan
+        )
 
         skew = float(pd.Series(net_pnl).skew()) if len(net_pnl) > 2 else np.nan
         kurtosis = float(pd.Series(net_pnl).kurt()) if len(net_pnl) > 3 else np.nan

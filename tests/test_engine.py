@@ -7,6 +7,7 @@ import pandas as pd
 
 from backtestlibrary.bt_types import EntryCandidate
 from backtestlibrary.engine import BacktestConfig, ChronologicalBacktestEngine
+from backtestlibrary.sizers import FixedSizeSizer, KellySizer, PercentOfEquitySizer, RiskSizer
 
 
 class TestSizePosition:
@@ -81,6 +82,79 @@ class TestSizePosition:
         shares, value = engine._size_position(0.0, row, 10_000, stop_price=95.0)
         assert shares == 0
         assert value == 0.0
+
+    def test_fixed_size_sizer(self):
+        """FixedSizeSizer returns fixed share count; no stop required."""
+        cfg = BacktestConfig(
+            session_start=time(9, 30),
+            session_end=time(16, 0),
+            sizer=FixedSizeSizer(stake=50),
+            equity_cap_pct=1.0,
+            absolute_cap_value=1e9,
+        )
+        engine = ChronologicalBacktestEngine(cfg)
+        row = pd.Series({"Ticker": "AAPL"})
+        shares, value = engine._size_position(100.0, row, 10_000, stop_price=None)
+        assert shares == 50
+        assert value == 5000.0
+
+    def test_percent_of_equity_sizer(self):
+        """PercentOfEquitySizer: 10% of 10k at 100 = 10 shares."""
+        cfg = BacktestConfig(
+            session_start=time(9, 30),
+            session_end=time(16, 0),
+            sizer=PercentOfEquitySizer(percent=0.10),
+            equity_cap_pct=1.0,
+            absolute_cap_value=1e9,
+        )
+        engine = ChronologicalBacktestEngine(cfg)
+        row = pd.Series({"Ticker": "AAPL"})
+        shares, value = engine._size_position(100.0, row, 10_000, stop_price=None)
+        assert shares == 10
+        assert value == 1000.0
+
+    def test_kelly_sizer(self):
+        """KellySizer with win_rate and payoff_ratio sizes by Kelly fraction."""
+        cfg = BacktestConfig(
+            session_start=time(9, 30),
+            session_end=time(16, 0),
+            sizer=KellySizer(win_rate=0.55, payoff_ratio=1.2, fraction=0.5),
+            equity_cap_pct=2.0,
+            absolute_cap_value=1e9,
+        )
+        engine = ChronologicalBacktestEngine(cfg)
+        row = pd.Series({"Ticker": "AAPL"})
+        # f* = (0.55*1.2 - 0.45)/1.2 = 0.175; half-Kelly = 0.0875
+        # risk_dollars = 10_000 * 0.0875 = 875, risk_per_share = 5 -> 175 shares (cap allows 200)
+        shares, value = engine._size_position(100.0, row, 10_000, stop_price=95.0)
+        assert shares == 175
+        assert value == 17500.0
+
+    def test_pick_sizer_via_config(self):
+        """Config.sizer selects which sizer is used; default is RiskSizer."""
+        row = pd.Series({"Ticker": "AAPL"})
+        # Default (no sizer) = RiskSizer with config
+        cfg_risk = BacktestConfig(
+            session_start=time(9, 30),
+            session_end=time(16, 0),
+            risk_pct_per_trade=0.05,
+            equity_cap_pct=1.0,
+            absolute_cap_value=1e9,
+        )
+        engine_risk = ChronologicalBacktestEngine(cfg_risk)
+        sh1, _ = engine_risk._size_position(100.0, row, 10_000, stop_price=95.0)
+        assert sh1 == 100
+        # Explicit FixedSize (cap high enough so 200 shares allowed)
+        cfg_fixed = BacktestConfig(
+            session_start=time(9, 30),
+            session_end=time(16, 0),
+            sizer=FixedSizeSizer(stake=200),
+            equity_cap_pct=2.0,
+            absolute_cap_value=1e9,
+        )
+        engine_fixed = ChronologicalBacktestEngine(cfg_fixed)
+        sh2, _ = engine_fixed._size_position(100.0, row, 10_000, stop_price=95.0)
+        assert sh2 == 200
 
 
 class TestEngineIntegration:
@@ -169,3 +243,44 @@ class TestEngineIntegration:
         r = results["2022"][100_000]
         # 1 day in sample_cleaned_year_data -> daily_equity = [start, end_day1]
         assert len(r.daily_equity) == 2
+
+    def test_use_library_columns_off_by_default(self, sample_cleaned_year_data, strategy_one_entry_with_stop):
+        """Default config has use_library_columns=False; run completes and produces trades."""
+        cfg = BacktestConfig(
+            session_start=time(9, 30),
+            session_end=time(16, 0),
+            risk_pct_per_trade=0.05,
+        )
+        assert cfg.use_library_columns is False
+        engine = ChronologicalBacktestEngine(cfg)
+        results, _, _ = engine.run(
+            sample_cleaned_year_data,
+            strategy_one_entry_with_stop,
+            starting_accounts=[100_000],
+        )
+        r = results["2022"][100_000]
+        assert r.total_trades >= 1
+        assert isinstance(r.trades, pd.DataFrame)
+
+    def test_use_library_columns_on_captures_entry_and_exit_columns(
+        self, sample_cleaned_year_data, strategy_one_entry_with_stop
+    ):
+        """With use_library_columns=True, engine runs entry/exit column logic (entry at entry time, exit at exit)."""
+        cfg = BacktestConfig(
+            session_start=time(9, 30),
+            session_end=time(16, 0),
+            risk_pct_per_trade=0.05,
+            use_library_columns=True,
+        )
+        engine = ChronologicalBacktestEngine(cfg)
+        results, _, _ = engine.run(
+            sample_cleaned_year_data,
+            strategy_one_entry_with_stop,
+            starting_accounts=[100_000],
+        )
+        r = results["2022"][100_000]
+        assert r.total_trades >= 1
+        assert not r.trades.empty
+        # Exit columns from librarycolumn (or defaults) should be present on the trade row
+        first = r.trades.iloc[0]
+        assert "Col_ATR14_Exit" in first.index or "Col_VWAP_Exit" in first.index
