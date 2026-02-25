@@ -103,6 +103,12 @@ resampled_df = resample_wide_intraday(wide_df, rule_minutes=5, session_start=(9,
 config = BacktestConfig(..., timeline_step_seconds=300)  # 5 * 60
 ```
 
+## Library columns safety
+
+- With `use_library_columns=True`, the engine copies the entry snapshot per position (commit 3d38a9a), so same-bar entries do not share one dict.
+- Lookahead prevention in bar selection is your responsibility inside `find_entries_for_day`; the engine only enforces chronological execution.
+- When using librarycolumn from commit bafc061 or later, entry columns are built to be lookahead-free for 1m+ data.
+
 ## Performance notes
 
 - The engine keeps chronological execution semantics unchanged.

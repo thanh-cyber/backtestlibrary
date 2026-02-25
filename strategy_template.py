@@ -39,6 +39,7 @@ class StrategyTemplate:
     ) -> list[EntryCandidate]:
         candidates: list[EntryCandidate] = []
         # TODO: implement your entry scan logic.
+        # With librarycolumn (bafc061+), you may safely use all Col_* at entry for filtering.
         # Example:
         # - iterate rows/tickers
         # - find first qualifying timestamp
