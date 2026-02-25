@@ -31,7 +31,8 @@ def write_trades_csv(
     if enriched_long_df is not None and not enriched_long_df.empty:
         from .columns import attach_continuous_tracking
         result = attach_continuous_tracking(result, enriched_long_df)
-        to_write = result.trades
+        if result.trades is not None:
+            to_write = result.trades
     to_write.to_csv(path, index=False, date_format="%Y-%m-%d %H:%M:%S")
 
 
@@ -56,5 +57,6 @@ def write_trades_excel(
     if enriched_long_df is not None and not enriched_long_df.empty:
         from .columns import attach_continuous_tracking
         result = attach_continuous_tracking(result, enriched_long_df)
-        to_write = result.trades
+        if result.trades is not None:
+            to_write = result.trades
     to_write.to_excel(path, index=False, engine="openpyxl")

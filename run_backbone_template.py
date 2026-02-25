@@ -25,11 +25,15 @@ def main() -> None:
     )
     cleaned_year_data = loader.load_cleaned_year_data()
 
+    # use_library_columns=True + pip install librarycolumn → Entry_Col_* at entry, Col_*_Exit at exit
+    # sizer: RiskSizer (default), FixedSizeSizer, PercentOfEquitySizer, KellySizer
     engine = ChronologicalBacktestEngine(
         BacktestConfig(
             session_start=time(9, 30),
             session_end=time(16, 0),
             risk_pct_per_trade=0.05,
+            use_library_columns=False,
+            sizer=None,  # None = RiskSizer(config); or e.g. FixedSizeSizer(stake=100)
         ),
         analyzers=DEFAULT_ANALYZERS,
     )
