@@ -274,6 +274,7 @@ class ChronologicalBacktestEngine:
                     if self.config.use_library_columns:
                         entry_column_snapshot = {}
                         apply_entry_columns(entry_column_snapshot, row)
+                        entry_column_snapshot = entry_column_snapshot.copy()
 
                     open_positions.append(
                         Position(
