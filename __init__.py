@@ -39,6 +39,12 @@ from .feed import (
 )
 from .io import write_trades_csv, write_trades_excel
 from .plotting import plot_equity_drawdown, plot_result, plot_trade_pnl
+from .librarycolumn_enrichment import (
+    enrich_cleaned_year_data,
+    get_row_at_time,
+    wide_to_long,
+    enrich_long_with_library_columns,
+)
 from .columns import (
     apply_exit_columns,
     attach_continuous_tracking,
@@ -79,6 +85,10 @@ __all__ = [
     "attach_exit_metrics_from_intraday_data",
     "write_trades_csv",
     "write_trades_excel",
+    "enrich_cleaned_year_data",
+    "get_row_at_time",
+    "wide_to_long",
+    "enrich_long_with_library_columns",
     "DataFeedConfig",
     "PandasDataFeed",
     "REQUIRED_FEED_COLUMNS",

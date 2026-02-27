@@ -45,22 +45,22 @@ class TestColumnsModule:
             assert trade_dict.get("Entry_Col_VWAP") == 100.2
 
     def test_apply_exit_columns_adds_exit_suffix(self):
-        """apply_exit_columns adds Col_X_Exit from row to trade_dict."""
+        """apply_exit_columns adds Exit_Col_X from row to trade_dict."""
         trade_dict = {"ticker": "AAPL", "net_pnl": 100.0}
         row = pd.Series({"Col_ATR14": 1.5, "Col_VWAP": 100.2, "other": 99})
         apply_exit_columns(trade_dict, row)
-        assert trade_dict.get("Col_ATR14_Exit") == 1.5
-        assert trade_dict.get("Col_VWAP_Exit") == 100.2
+        assert trade_dict.get("Exit_Col_ATR14") == 1.5
+        assert trade_dict.get("Exit_Col_VWAP") == 100.2
 
     def test_apply_exit_columns_skips_missing(self):
         """Missing or invalid values are skipped."""
         trade_dict = {}
         row = pd.Series({"Col_ATR14": 1.0})
         apply_exit_columns(trade_dict, row)
-        assert "Col_ATR14_Exit" in trade_dict
-        assert trade_dict["Col_ATR14_Exit"] == 1.0
-        # Col_VWAP not in row so no Col_VWAP_Exit
-        assert "Col_VWAP_Exit" not in trade_dict or trade_dict.get("Col_VWAP_Exit") is None
+        assert "Exit_Col_ATR14" in trade_dict
+        assert trade_dict["Exit_Col_ATR14"] == 1.0
+        # Col_VWAP not in row so no Exit_Col_VWAP
+        assert "Exit_Col_VWAP" not in trade_dict or trade_dict.get("Exit_Col_VWAP") is None
 
     def test_has_librarycolumn_bool(self):
         """has_librarycolumn returns bool."""

@@ -16,14 +16,14 @@ def write_trades_csv(
 ) -> None:
     """Write backtest trades to CSV with Entry, Exit, and optionally Continuous columns.
 
-    Columns are labelled: Entry_Col_X (entry snapshot), Col_X_Exit (exit snapshot),
-    Cont_Col_X_Entry/Exit/Max/Min/At30min/At60min (continuous, only if enriched_long_df provided).
+    Columns are labelled: Entry_Col_X (entry snapshot), Exit_Col_X (exit snapshot),
+    Continuous_Col_X_Entry/Exit/Max/Min/At30min/At60min (continuous, only if enriched_long_df provided).
 
     Args:
         result: RunResult from ChronologicalBacktestEngine.
         path: Output file path (e.g. "trades.csv" or Path("backtest_results/trades.csv")).
         enriched_long_df: Optional minute-level long DataFrame with Ticker, datetime and Col_*.
-                          If provided, runs attach_continuous_tracking so CSV includes Cont_* columns.
+                          If provided, runs attach_continuous_tracking so CSV includes Continuous_Col_* columns.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -44,12 +44,12 @@ def write_trades_excel(
 ) -> None:
     """Write backtest trades to Excel with Entry, Exit, and optionally Continuous columns.
 
-    Same column labelling as write_trades_csv: Entry_Col_X, Col_X_Exit, Cont_Col_X_*.
+    Same column labelling as write_trades_csv: Entry_Col_*, Exit_Col_*, Continuous_Col_*.
 
     Args:
         result: RunResult from ChronologicalBacktestEngine.
         path: Output file path (e.g. "trades.xlsx").
-        enriched_long_df: Optional minute-level long DataFrame; if provided, adds Cont_* columns.
+        enriched_long_df: Optional minute-level long DataFrame; if provided, adds Continuous_Col_* columns.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

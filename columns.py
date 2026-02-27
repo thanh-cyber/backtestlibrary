@@ -3,10 +3,10 @@ Column module: applies librarycolumn's entry / exit / continuous sections to the
 
 When the engine is run with config.use_library_columns=True:
 - Entry: metrics are captured at entry time (apply_entry_columns on the entry bar row) and stored on the position; at close they are merged into the trade as Entry_Col_*.
-- Exit: metrics are captured at exit time (apply_exit_columns on the exit bar row) and added to the trade as Col_*_Exit.
-- Continuous: run after the backtest via attach_continuous_tracking(result, enriched_long_df), or by passing enriched_long_df to write_trades_csv/write_trades_excel so Cont_Col_*_Entry/Exit/Max/Min/At30min/At60min are added.
+- Exit: metrics are captured at exit time (apply_exit_columns on the exit bar row) and added to the trade as Exit_Col_*.
+- Continuous: run after the backtest via attach_continuous_tracking(result, enriched_long_df), or by passing enriched_long_df to write_trades_csv/write_trades_excel so Continuous_Col_*_Entry/Exit/Max/Min/At30min/At60min are added.
 
-When use_library_columns=False (default), the engine does not run entry/exit column logic.
+When use_library_columns=False, the engine does not run entry/exit column logic. Default is True so columns are always included.
 
 Requires: pip install librarycolumn  (or backtestlibrary[librarycolumn])
 If librarycolumn is not installed, get_entry_columns/get_exit_columns return minimal defaults and
@@ -36,11 +36,15 @@ def _lib() -> Optional[object]:
 
 
 def get_entry_columns() -> List[str]:
-    """Return list of column names available at entry (from librarycolumn.ENTRY_COLUMNS)."""
+    """Return list of column names available at entry (from librarycolumn.ENTRY_COLUMNS).
+    If ENTRY_COLUMNS is missing or empty, falls back to exit columns so Entry_Col_* are still written."""
     lib = _lib()
     if lib is not None and hasattr(lib, "ENTRY_COLUMNS"):
-        return list(getattr(lib, "ENTRY_COLUMNS", _DEFAULT_ENTRY_COLUMNS))
-    return list(_DEFAULT_ENTRY_COLUMNS)
+        entry = list(getattr(lib, "ENTRY_COLUMNS", _DEFAULT_ENTRY_COLUMNS))
+        if entry:
+            return entry
+    # Fallback: use same as exit columns so we get Entry_Col_ATR14, Entry_Col_VWAP, etc.
+    return list(get_exit_columns())
 
 
 def get_exit_columns() -> List[str]:
@@ -59,10 +63,10 @@ def get_continuous_columns() -> List[str]:
     return list(_DEFAULT_CONTINUOUS_COLUMNS)
 
 
-# Column name prefixes/suffixes so Excel clearly shows Entry vs Exit vs Continuous
-ENTRY_COLUMN_PREFIX = "Entry_"   # Entry_Col_ATR14 = entry snapshot
-EXIT_COLUMN_SUFFIX = "_Exit"     # Col_ATR14_Exit = exit snapshot
-CONTINUOUS_COLUMN_PREFIX = "Cont_"  # Cont_Col_RSI14_Entry, Cont_Col_RSI14_Max, etc.
+# Column name prefixes (congruent: Entry_Col_X, Exit_Col_X, Continuous_Col_X_*)
+ENTRY_COLUMN_PREFIX = "Entry_"       # Entry_Col_ATR14 = entry snapshot
+EXIT_COLUMN_PREFIX = "Exit_"         # Exit_Col_ATR14 = exit snapshot
+CONTINUOUS_COLUMN_PREFIX = "Continuous_"  # Continuous_Col_RSI14_Entry, Continuous_Col_RSI14_Max, etc.
 
 
 def apply_entry_columns(trade_dict: dict, row: pd.Series) -> None:
@@ -88,7 +92,7 @@ def apply_entry_columns(trade_dict: dict, row: pd.Series) -> None:
 
 def apply_exit_columns(trade_dict: dict, row: pd.Series) -> None:
     """
-    Mutate trade_dict to add Col_X_Exit for each X in get_exit_columns() from row.
+    Mutate trade_dict to add Exit_Col_X for each X in get_exit_columns() from row.
     Call this with the exit bar row before appending the trade to trades_list.
     """
     for col in get_exit_columns():
@@ -104,7 +108,7 @@ def apply_exit_columns(trade_dict: dict, row: pd.Series) -> None:
                 continue
         except (TypeError, ValueError):
             continue
-        trade_dict[f"{col}{EXIT_COLUMN_SUFFIX}"] = v
+        trade_dict[f"{EXIT_COLUMN_PREFIX}{col}"] = v
 
 
 def _trade_datetime(date_series: pd.Series, time_series: pd.Series) -> pd.Series:
@@ -151,6 +155,9 @@ def attach_continuous_tracking(
     if trades is None or trades.empty:
         return result
     tr = trades.copy()
+    # Normalize date column: TradeRecord uses "date"; support "Date" from other sources
+    if "date" not in tr.columns and "Date" in tr.columns:
+        tr["date"] = tr["Date"]
     if "EntryTime" not in tr.columns and "date" in tr.columns and "entry_time" in tr.columns:
         tr["EntryTime"] = _trade_datetime(tr["date"], tr["entry_time"])
     if "ExitTime" not in tr.columns and "date" in tr.columns and "exit_time" in tr.columns:
@@ -167,7 +174,7 @@ def attach_continuous_tracking(
         columns=columns,
         at_minutes=at_minutes,
     )
-    # Rename continuous columns so they're clearly labelled: Cont_Col_X_Entry, Cont_Col_X_Exit, etc.
+    # Rename continuous columns: Continuous_Col_X_Entry, Continuous_Col_X_Exit, etc.
     cont_cols = columns if columns is not None else get_continuous_columns()
     at_mins = at_minutes if at_minutes is not None else [30, 60]
     renames = {}

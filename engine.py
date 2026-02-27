@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import time
 import inspect
-from typing import Any, Callable, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,7 @@ from .bt_types import Position, RunResult, Strategy, TradeRecord
 from .analyzers import build_full_metrics
 from .sizers import RiskSizer
 from .columns import apply_entry_columns, apply_exit_columns
+from .trade_enrichment import enrich_trades_post_backtest
 
 
 @dataclass
@@ -34,7 +36,7 @@ class BacktestConfig:
     timeline_step_seconds: int = 60
     float_col: str = "Float_Numeric"
     exit_price_col: str = "Exit_Price"
-    use_library_columns: bool = False  # When True, engine runs entry/exit columns from librarycolumn at entry/exit time; default off
+    use_library_columns: bool = True  # When True, engine runs entry/exit columns from librarycolumn at entry/exit time; default on so columns are always included
 
 
 def _time_to_minutes(t: time) -> int:
@@ -99,6 +101,16 @@ def _time_candidates(t: time) -> list[object]:
     ]
 
 
+def _time_candidates_utc_fallback(t: time) -> list[str]:
+    """Polygon flat files: cache may use UTC column names (9:30 ET = 14:30 UTC EST, 13:30 EDT)."""
+    out = []
+    for offset in (5, 4):
+        uh = (t.hour + offset) % 24
+        out.append(f"{uh}:{t.minute:02d}")
+        out.append(f"{uh:02d}:{t.minute:02d}")
+    return out
+
+
 def get_row_price(row: pd.Series, t: time) -> Optional[float]:
     """Robustly read a bar price from wide time-column row."""
     candidates = _time_candidates(t)
@@ -113,6 +125,12 @@ def get_row_price(row: pd.Series, t: time) -> Optional[float]:
         col_str = str(col)
         if col_str in str_candidates or any(col_str.endswith(sc) for sc in str_candidates):
             px = _to_float(row[col])
+            if px is not None and px > 0:
+                return px
+    # Polygon/cache: try UTC column names (9:30 ET -> 14:30 or 13:30 UTC)
+    for c in _time_candidates_utc_fallback(t):
+        if c in row.index:
+            px = _to_float(row[c])
             if px is not None and px > 0:
                 return px
     return None
@@ -152,6 +170,12 @@ def _build_day_price_cache(
                 col_s = str(col)
                 if col_s in cand_str or any(col_s.endswith(cs) for cs in cand_str):
                     chosen_col = col
+                    break
+        if chosen_col is None:
+            # Polygon/cache: try UTC column names (9:30 ET -> 14:30 or 13:30 UTC)
+            for c in _time_candidates_utc_fallback(t):
+                if c in day_df.columns:
+                    chosen_col = c
                     break
         if chosen_col is None:
             continue
@@ -200,29 +224,212 @@ class ChronologicalBacktestEngine:
 
     def run(
         self,
-        cleaned_year_data: dict[str, pd.DataFrame],
+        cleaned_year_data: dict[str, Union[pd.DataFrame, Path]],
         strategy: Strategy,
         starting_accounts: list[int],
+        chunk_days: int = 21,
+        show_progress: bool = False,
     ) -> tuple[dict[str, dict[int, RunResult]], pd.DataFrame, dict[tuple[str, int], list[float]]]:
-        """Run backtest per year/account; returns (results, metrics_df, equity_curves)."""
+        """Run backtest per year/account; returns (results, metrics_df, equity_curves).
+        When a value is a Path (stream_from_cache), the year is read in date-chunks to avoid loading full year in RAM.
+        chunk_days: number of trading days per chunk when streaming from Path (default 21 ~ 1 month).
+        show_progress: if True, show a tqdm progress bar (0-100% by day or chunk).
+        Entry/Exit/Continuous columns are applied in a post-backtest enrichment pass.
+        """
         results: dict[str, dict[int, RunResult]] = {}
+        iter_items = list(cleaned_year_data.items())
+        # Paths for streaming: used by post-enrichment to load wide data for trades
+        wide_path_by_year = {
+            k: Path(v) for k, v in cleaned_year_data.items()
+            if isinstance(v, (Path, str))
+        }
 
-        for year, df_year in cleaned_year_data.items():
+        # Precompute total steps so the bar shows 0-100% (per day for in-memory, per chunk for streamed)
+        total_steps = 0
+        if show_progress:
+            for year, data in iter_items:
+                if isinstance(data, (Path, str)):
+                    path = Path(data)
+                    path_str = str(path.resolve())
+                    try:
+                        dates_df = pd.read_parquet(path_str, columns=["Date"])
+                    except Exception:
+                        dates_df = pd.read_parquet(path_str)
+                    if "Date" not in dates_df.columns:
+                        continue
+                    dates_df["Date"] = pd.to_datetime(dates_df["Date"], errors="coerce").dt.normalize()
+                    n_dates = dates_df["Date"].dropna().nunique()
+                    n_chunks = (n_dates + chunk_days - 1) // chunk_days if n_dates else 0
+                    total_steps += n_chunks * len(starting_accounts)
+                else:
+                    df = data
+                    if "Date" in df.columns:
+                        df = df.copy()
+                        df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
+                        df = df.dropna(subset=["Date"])
+                        n_days = df.groupby("Date").ngroups
+                    else:
+                        n_days = 0
+                    total_steps += n_days * len(starting_accounts)
+        pbar = None
+        if show_progress and total_steps > 0:
+            try:
+                from tqdm.auto import tqdm
+                pbar = tqdm(total=total_steps, desc="Backtest", unit="day")
+            except ImportError:
+                pass
+
+        for year, data in iter_items:
             results[year] = {}
-            if "Date" in df_year.columns:
-                df_year = df_year.copy()
-                df_year["Date"] = pd.to_datetime(df_year["Date"], errors="coerce").dt.normalize()
-                df_year = df_year.dropna(subset=["Date"]).sort_values("Date")
+            if isinstance(data, (Path, str)):
+                path = Path(data)
+                for starting_account in starting_accounts:
+                    run_result = self._run_single_account_streamed(
+                        path, starting_account, strategy, chunk_days, pbar=pbar
+                    )
+                    run_result = self._enrich_trades(run_result, cleaned_year_data, wide_path_by_year)
+                    results[year][starting_account] = run_result
+            else:
+                df_year = data
+                if "Date" in df_year.columns:
+                    df_year = df_year.copy()
+                    df_year["Date"] = pd.to_datetime(df_year["Date"], errors="coerce").dt.normalize()
+                    df_year = df_year.dropna(subset=["Date"]).sort_values("Date")
+                daily_groups = df_year.groupby("Date")
+                for starting_account in starting_accounts:
+                    run_result = self._run_single_account(
+                        daily_groups,
+                        starting_account,
+                        strategy,
+                        pbar=pbar,
+                        enriched_long_df=None,
+                    )
+                    run_result = self._enrich_trades(run_result, cleaned_year_data, wide_path_by_year)
+                    results[year][starting_account] = run_result
 
-            daily_groups = df_year.groupby("Date")
-            for starting_account in starting_accounts:
-                run_result = self._run_single_account(daily_groups, starting_account, strategy)
-                results[year][starting_account] = run_result
-
+        if pbar is not None:
+            pbar.close()
         metrics_df, equity_curves = build_full_metrics(results, starting_accounts)
         return results, metrics_df, equity_curves
 
-    def _run_single_account(self, daily_groups, starting_account: int, strategy: Strategy) -> RunResult:
+    def _enrich_trades(
+        self,
+        result: RunResult,
+        cleaned_year_data: dict,
+        wide_path_by_year: dict,
+    ) -> RunResult:
+        """Post-backtest enrichment: Entry_Col_*, Exit_Col_*, Continuous_Col_*."""
+        return enrich_trades_post_backtest(
+            result,
+            cleaned_year_data,
+            wide_path_by_year,
+            session_start=self.config.session_start,
+            session_end=self.config.session_end,
+            config=self.config,
+        )
+
+    def _run_single_account_streamed(
+        self,
+        path: Path,
+        starting_account: int,
+        strategy: Strategy,
+        chunk_days: int,
+        pbar: Optional[Any] = None,
+    ) -> RunResult:
+        """Run backtest for one account by reading parquet in date-chunks; merge results."""
+        path = Path(path)
+        path_str = str(path.resolve())
+        # Get unique dates without loading full file (read only Date column)
+        try:
+            dates_df = pd.read_parquet(path_str, columns=["Date"])
+        except Exception:
+            dates_df = pd.read_parquet(path_str)
+            if "Date" not in dates_df.columns:
+                return RunResult(
+                    final_balance=float(starting_account),
+                    total_return_pct=0.0,
+                    total_trades=0,
+                    winning_trades=0,
+                    losing_trades=0,
+                    total_pnl=0.0,
+                    trades=pd.DataFrame(),
+                    daily_equity=[float(starting_account)],
+                )
+        dates_df["Date"] = pd.to_datetime(dates_df["Date"], errors="coerce").dt.normalize()
+        unique_dates = sorted(dates_df["Date"].dropna().unique().tolist())
+        del dates_df
+        if not unique_dates:
+            return RunResult(
+                final_balance=float(starting_account),
+                total_return_pct=0.0,
+                total_trades=0,
+                winning_trades=0,
+                losing_trades=0,
+                total_pnl=0.0,
+                trades=pd.DataFrame(),
+                daily_equity=[float(starting_account)],
+            )
+        all_trades: list[dict] = []
+        daily_equity: list[float] = [float(starting_account)]
+        balance = float(starting_account)
+        for i in range(0, len(unique_dates), chunk_days):
+            chunk_dates = unique_dates[i : i + chunk_days]
+            d_min, d_max = chunk_dates[0], chunk_dates[-1]
+            try:
+                df_chunk = pd.read_parquet(path_str, filters=[("Date", ">=", d_min), ("Date", "<=", d_max)])
+            except Exception:
+                df_chunk = pd.read_parquet(path_str)
+                df_chunk = df_chunk[
+                    (pd.to_datetime(df_chunk["Date"], errors="coerce").dt.normalize() >= pd.Timestamp(d_min))
+                    & (pd.to_datetime(df_chunk["Date"], errors="coerce").dt.normalize() <= pd.Timestamp(d_max))
+                ]
+            if df_chunk.empty:
+                continue
+            df_chunk["Date"] = pd.to_datetime(df_chunk["Date"], errors="coerce").dt.normalize()
+            df_chunk = df_chunk.dropna(subset=["Date"]).sort_values("Date")
+            daily_groups = df_chunk.groupby("Date")
+            run = self._run_single_account(daily_groups, int(round(balance)), strategy, pbar=None)
+            all_trades.extend(run.trades.to_dict("records") if not run.trades.empty else [])
+            balance = run.final_balance
+            if run.daily_equity:
+                daily_equity.extend(run.daily_equity[1:])
+            del df_chunk
+            if pbar is not None:
+                pbar.update(1)
+        total_pnl = balance - float(starting_account)
+        total_return_pct = (total_pnl / float(starting_account) * 100.0) if starting_account > 0 else 0.0
+        trades_df = pd.DataFrame(all_trades) if all_trades else pd.DataFrame()
+        total_trades = len(all_trades)
+        winning_trades = sum(1 for t in all_trades if t.get("net_pnl", 0) > 0)
+        losing_trades = total_trades - winning_trades
+        result = RunResult(
+            final_balance=balance,
+            total_return_pct=total_return_pct,
+            total_trades=total_trades,
+            winning_trades=winning_trades,
+            losing_trades=losing_trades,
+            total_pnl=total_pnl,
+            trades=trades_df,
+            daily_equity=daily_equity,
+        )
+        for analyzer in self.analyzers:
+            name = analyzer.__class__.__name__.replace("Analyzer", "")
+            result.analyzers[name] = analyzer.analyze(result)
+        return result
+
+    def _run_single_account(
+        self,
+        daily_groups,
+        starting_account: int,
+        strategy: Strategy,
+        pbar: Optional[Any] = None,
+        enriched_long_df: Optional[pd.DataFrame] = None,
+    ) -> RunResult:
+        get_row_at_time = None
+        if enriched_long_df is not None:
+            from .librarycolumn_enrichment import get_row_at_time as _get_row_at_time
+            get_row_at_time = _get_row_at_time
+
         account_balance = float(starting_account)
         available_balance = float(starting_account)
         total_trades = 0
@@ -272,8 +479,15 @@ class ChronologicalBacktestEngine:
 
                     entry_column_snapshot: Optional[dict] = None
                     if self.config.use_library_columns:
+                        row_for_entry = row
+                        if get_row_at_time is not None:
+                            row_at_entry = get_row_at_time(
+                                enriched_long_df, entry.ticker, date, entry.entry_time
+                            )
+                            if row_at_entry is not None:
+                                row_for_entry = row_at_entry
                         entry_column_snapshot = {}
-                        apply_entry_columns(entry_column_snapshot, row)
+                        apply_entry_columns(entry_column_snapshot, row_for_entry)
                         entry_column_snapshot = entry_column_snapshot.copy()
 
                     open_positions.append(
@@ -384,9 +598,16 @@ class ChronologicalBacktestEngine:
                     trade.account_balance_after = account_balance
                     tdict = asdict(trade)
                     if self.config.use_library_columns:
+                        row_for_exit = row
+                        if get_row_at_time is not None:
+                            row_at_exit = get_row_at_time(
+                                enriched_long_df, pos.ticker, date, current_time
+                            )
+                            if row_at_exit is not None:
+                                row_for_exit = row_at_exit
                         if pos.entry_column_snapshot:
                             tdict.update(pos.entry_column_snapshot)
-                        apply_exit_columns(tdict, row)
+                        apply_exit_columns(tdict, row_for_exit)
                     trades_list.append(tdict)
 
                     if account_balance <= 0:
@@ -396,6 +617,8 @@ class ChronologicalBacktestEngine:
                 open_positions = still_open
 
             daily_equity.append(account_balance)
+            if pbar is not None:
+                pbar.update(1)
             if account_balance <= 0:
                 break
 
@@ -511,8 +734,8 @@ class ChronologicalBacktestEngine:
         trade.Col_MaxDrawdownFromMFE_R = float(pos.max_dd_from_mfe)
         atr = _to_float(row.get("Col_ATR14"))
         vwap = _to_float(row.get("Col_VWAP"))
-        trade.Col_ATR14_Exit = float(atr) if atr is not None else 0.0
-        trade.Col_VWAP_Exit = float(vwap) if vwap is not None else 0.0
+        trade.Exit_Col_ATR14 = float(atr) if atr is not None else 0.0
+        trade.Exit_Col_VWAP = float(vwap) if vwap is not None else 0.0
         if atr is not None and atr > 0 and pos.shares != 0:
             risk_dollar_unit = (pos.entry_price * abs(pos.shares)) / atr
             trade.Col_FinalPL_R = float(net_pnl / risk_dollar_unit) if risk_dollar_unit > 0 else 0.0

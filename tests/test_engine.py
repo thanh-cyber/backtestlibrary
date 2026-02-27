@@ -244,14 +244,14 @@ class TestEngineIntegration:
         # 1 day in sample_cleaned_year_data -> daily_equity = [start, end_day1]
         assert len(r.daily_equity) == 2
 
-    def test_use_library_columns_off_by_default(self, sample_cleaned_year_data, strategy_one_entry_with_stop):
-        """Default config has use_library_columns=False; run completes and produces trades."""
+    def test_use_library_columns_on_by_default(self, sample_cleaned_year_data, strategy_one_entry_with_stop):
+        """Default config has use_library_columns=True so entry/exit columns are always included; run completes and produces trades."""
         cfg = BacktestConfig(
             session_start=time(9, 30),
             session_end=time(16, 0),
             risk_pct_per_trade=0.05,
         )
-        assert cfg.use_library_columns is False
+        assert cfg.use_library_columns is True
         engine = ChronologicalBacktestEngine(cfg)
         results, _, _ = engine.run(
             sample_cleaned_year_data,
@@ -283,4 +283,4 @@ class TestEngineIntegration:
         assert not r.trades.empty
         # Exit columns from librarycolumn (or defaults) should be present on the trade row
         first = r.trades.iloc[0]
-        assert "Col_ATR14_Exit" in first.index or "Col_VWAP_Exit" in first.index
+        assert "Exit_Col_ATR14" in first.index or "Exit_Col_VWAP" in first.index

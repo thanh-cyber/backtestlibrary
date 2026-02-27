@@ -25,7 +25,7 @@ def main() -> None:
     )
     cleaned_year_data = loader.load_cleaned_year_data()
 
-    # use_library_columns=True + pip install librarycolumn → Entry_Col_* at entry, Col_*_Exit at exit
+    # use_library_columns=True + pip install librarycolumn → Entry_Col_* at entry, Exit_Col_* at exit
     # sizer: RiskSizer (default), FixedSizeSizer, PercentOfEquitySizer, KellySizer
     engine = ChronologicalBacktestEngine(
         BacktestConfig(

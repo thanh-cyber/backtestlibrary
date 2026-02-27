@@ -109,8 +109,8 @@ class TradeRecord:
     Col_BarsSinceEntry: int = 0
     Col_PosSize_PctAccount: float = 0.0
     # Metrics at exit bar (for exit columns / downstream use)
-    Col_ATR14_Exit: float = 0.0
-    Col_VWAP_Exit: float = 0.0
+    Exit_Col_ATR14: float = 0.0
+    Exit_Col_VWAP: float = 0.0
 
 
 @dataclass

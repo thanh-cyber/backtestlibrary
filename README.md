@@ -85,6 +85,16 @@ results, metrics_df, equity_curves = engine.run(cleaned_year_data, strategy, sta
 
 Use `validate_feed(df)` to check contract; `normalize_feed(df)` to normalize dates and tickers.
 
+### Data from cache (backtestdata)
+
+The engine is built to use cache-backed data. You do **not** load cache inside backtestlibrary—you load it via **backtestdata** and pass the result to the engine.
+
+- **`cleaned_year_data`** can be `dict[str, pd.DataFrame]` (in-memory) or `dict[str, Path]` (paths to parquet files).
+- When you use **backtestdata** with a shared cache (e.g. `cache_dir` inside the backtestdata library), `load_cleaned_year_data(..., cache_dir=...)` can return **paths** instead of full DataFrames (`stream_from_cache=True` by default). The engine then reads each year in **date-chunks** from disk, so it never loads a full year into RAM.
+- Flow: `backtestdata.load_cleaned_year_data(years=..., cache_dir=...)` → `cleaned_year_data` (DataFrames or paths) → `engine.run(cleaned_year_data, strategy, starting_accounts)`.
+
+So the engine is geared to consume cache output directly; no extra step is required. See the **backtestdata** README for how to set up a shared cache.
+
 ### Resampling
 
 Resample wide-format minute bars to a coarser timeframe (e.g. 5m) so the engine runs on fewer bars. Use `timeline_step_seconds = rule_minutes * 60` in `BacktestConfig` when running on resampled data:
