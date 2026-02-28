@@ -37,6 +37,7 @@ class BacktestConfig:
     float_col: str = "Float_Numeric"
     exit_price_col: str = "Exit_Price"
     use_library_columns: bool = True  # When True, engine runs entry/exit columns from librarycolumn at entry/exit time; default on so columns are always included
+    defer_column_phase: bool = False  # When True, engine skips enrichment; run enrich_results(raw_results, ...) in a separate cell
 
 
 def _time_to_minutes(t: time) -> int:
@@ -63,6 +64,15 @@ def _to_float(value) -> Optional[float]:
     except ValueError:
         return None
     return x if np.isfinite(x) else None
+
+
+# Target times (hour, minute) for unrealized PL snapshots. Capture at first bar >= target.
+_UNREALIZED_SNAPSHOT_TARGETS: list[tuple[int, int, str]] = [
+    (10, 0, "1000"), (10, 30, "1030"), (11, 0, "1100"), (11, 30, "1130"),
+    (12, 0, "1200"), (12, 30, "1230"), (13, 0, "1300"), (13, 30, "1330"),
+    (14, 0, "1400"), (14, 30, "1430"), (15, 0, "1500"), (15, 30, "1530"),
+    (16, 0, "1600"),
+]
 
 
 def _pl_r_for_side(side: str, entry_price: float, current_price: float, atr: float) -> float:
@@ -287,7 +297,8 @@ class ChronologicalBacktestEngine:
                     run_result = self._run_single_account_streamed(
                         path, starting_account, strategy, chunk_days, pbar=pbar
                     )
-                    run_result = self._enrich_trades(run_result, cleaned_year_data, wide_path_by_year)
+                    if not self.config.defer_column_phase:
+                        run_result = self._enrich_trades(run_result, cleaned_year_data, wide_path_by_year)
                     results[year][starting_account] = run_result
             else:
                 df_year = data
@@ -304,7 +315,8 @@ class ChronologicalBacktestEngine:
                         pbar=pbar,
                         enriched_long_df=None,
                     )
-                    run_result = self._enrich_trades(run_result, cleaned_year_data, wide_path_by_year)
+                    if not self.config.defer_column_phase:
+                        run_result = self._enrich_trades(run_result, cleaned_year_data, wide_path_by_year)
                     results[year][starting_account] = run_result
 
         if pbar is not None:
@@ -528,33 +540,13 @@ class ChronologicalBacktestEngine:
                             pos.bars_to_mae = pos.bars_since_entry
                         pos.max_dd_from_mfe = min(pos.max_dd_from_mfe, current_pl_r - pos.peak_pl_r)
 
-                        hm = f"{current_time.hour:02d}{current_time.minute:02d}"
-                        if hm == "1000":
-                            pos.unrealized_pl_1000 = current_pl_r
-                        elif hm == "1030":
-                            pos.unrealized_pl_1030 = current_pl_r
-                        elif hm == "1100":
-                            pos.unrealized_pl_1100 = current_pl_r
-                        elif hm == "1130":
-                            pos.unrealized_pl_1130 = current_pl_r
-                        elif hm == "1200":
-                            pos.unrealized_pl_1200 = current_pl_r
-                        elif hm == "1230":
-                            pos.unrealized_pl_1230 = current_pl_r
-                        elif hm == "1300":
-                            pos.unrealized_pl_1300 = current_pl_r
-                        elif hm == "1330":
-                            pos.unrealized_pl_1330 = current_pl_r
-                        elif hm == "1400":
-                            pos.unrealized_pl_1400 = current_pl_r
-                        elif hm == "1430":
-                            pos.unrealized_pl_1430 = current_pl_r
-                        elif hm == "1500":
-                            pos.unrealized_pl_1500 = current_pl_r
-                        elif hm == "1530":
-                            pos.unrealized_pl_1530 = current_pl_r
-                        elif hm == "1600":
-                            pos.unrealized_pl_1600 = current_pl_r
+                        # Capture unrealized PL at first bar >= each target (robust to timeline_step_seconds)
+                        current_min = _time_to_minutes(current_time)
+                        for h, m, key in _UNREALIZED_SNAPSHOT_TARGETS:
+                            target_min = h * 60 + m
+                            if current_min >= target_min and key not in pos._unrealized_captured:
+                                setattr(pos, f"unrealized_pl_{key}", current_pl_r)
+                                pos._unrealized_captured.add(key)
 
                     # Increment bar counter once per processed bar while position is open.
                     pos.bars_since_entry += 1
@@ -728,7 +720,7 @@ class ChronologicalBacktestEngine:
         )
         # ---- Save elite exit analytics ----
         trade.Col_MaxFavorableExcursion_R = float(pos.mfe_r)
-        trade.Col_DistToInitialStop_R = float(pos.mae_r)
+        trade.Col_MAE_R = float(pos.mae_r)  # Max Adverse Excursion (was misnamed Col_DistToInitialStop_R)
         trade.Col_BarsToMFE = int(pos.bars_to_mfe)
         trade.Col_BarsToMAE = int(pos.bars_to_mae)
         trade.Col_MaxDrawdownFromMFE_R = float(pos.max_dd_from_mfe)

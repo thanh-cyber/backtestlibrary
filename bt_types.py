@@ -45,6 +45,7 @@ class Position:
     peak_pl_r: float = 0.0
     bars_since_entry: int = 0
     starting_account: float = 0.0
+    _unrealized_captured: set = field(default_factory=set)  # keys captured for "first bar >= target"
     unrealized_pl_1000: float = 0.0
     unrealized_pl_1030: float = 0.0
     unrealized_pl_1100: float = 0.0
@@ -83,7 +84,7 @@ class TradeRecord:
     # ====================== FINAL ELITE EXIT COLUMNS ======================
     # Core MFE/MAE Family
     Col_MaxFavorableExcursion_R: float = 0.0
-    Col_DistToInitialStop_R: float = 0.0
+    Col_MAE_R: float = 0.0  # Max Adverse Excursion (worst adverse move from entry, in R)
     Col_BarsToMFE: int = 0
     Col_BarsToMAE: int = 0
     Col_MaxDrawdownFromMFE_R: float = 0.0
