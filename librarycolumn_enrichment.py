@@ -10,9 +10,11 @@ so that Entry_Col_* and Exit_Col_* use the correct bar (entry bar vs exit bar).
 
 from __future__ import annotations
 
+import os
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import time
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -46,6 +48,14 @@ def _extract_volume_time_map(columns: list) -> dict[str, str]:
     return vol_map
 
 
+def _normalize_time_str(t_str: str) -> str:
+    """Normalize '9:30' or '09:30' -> '9:30' for merge keys."""
+    parts = t_str.split(":")
+    h = int(parts[0])
+    mm = int(parts[1]) if len(parts) > 1 else 0
+    return f"{h}:{mm:02d}"
+
+
 def wide_to_long(
     wide_df: pd.DataFrame,
     *,
@@ -59,6 +69,8 @@ def wide_to_long(
     optional "Vol 9:30", ... for volume.
     Long: Ticker, Date, datetime, open, high, low, close, volume.
     If only one price column per time, open=high=low=close.
+
+    Uses vectorized melt instead of iterrows for speed.
     """
     if wide_df.empty or date_col not in wide_df.columns:
         return pd.DataFrame()
@@ -75,46 +87,66 @@ def wide_to_long(
     if not value_vars:
         return pd.DataFrame()
 
-    long_list = []
-    wide_df = wide_df.dropna(subset=[date_col]).copy()
-    wide_df[date_col] = pd.to_datetime(wide_df[date_col], errors="coerce").dt.normalize()
+    work = wide_df.dropna(subset=[date_col]).copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce").dt.normalize()
+    work = work[work[date_col].notna()]
 
-    for _, r in wide_df.iterrows():
-        ticker = r[tc]
-        dt_date = r[date_col]
-        if pd.isna(dt_date):
-            continue
-        for t_str in value_vars:
-            close = r.get(t_str)
-            try:
-                close = float(close)
-            except (TypeError, ValueError):
-                continue
-            if pd.isna(close) or close <= 0:
-                continue
-            parts = t_str.split(":")
-            h, mm = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
-            dt_time = pd.Timestamp(dt_date) + pd.Timedelta(hours=h, minutes=mm)
-            vol_col = vol_map.get(t_str) or vol_map.get(f"{h}:{mm:02d}")
-            vol = float(r.get(vol_col, 1.0)) if vol_col else 1.0
-            if pd.isna(vol) or vol < 0:
-                vol = 1.0
-            long_list.append({
-                "Ticker": str(ticker).upper() if tc else "",
-                date_col: dt_date,
-                "datetime": dt_time,
-                "open": close,
-                "high": close,
-                "low": close,
-                "close": close,
-                "volume": vol,
-            })
+    # Melt price columns (vectorized)
+    price_melt = work.melt(
+        id_vars=[tc, date_col],
+        value_vars=value_vars,
+        var_name="time_str",
+        value_name="close",
+    )
+    price_melt["close"] = pd.to_numeric(price_melt["close"], errors="coerce")
+    price_melt = price_melt[price_melt["close"].notna() & (price_melt["close"] > 0)]
 
-    if not long_list:
+    if price_melt.empty:
         return pd.DataFrame(
             columns=["Ticker", date_col, "datetime", "open", "high", "low", "close", "volume"]
         )
-    out = pd.DataFrame(long_list)
+
+    # Merge volume (vectorized) if we have vol columns
+    vol_cols = [c for c in vol_map.values() if c in work.columns]
+    if vol_cols:
+        vol_reverse = {v: _normalize_time_str(k) for k, v in vol_map.items()}
+        vol_melt = work.melt(
+            id_vars=[tc, date_col],
+            value_vars=vol_cols,
+            var_name="vol_col",
+            value_name="volume",
+        )
+        vol_melt["time_key"] = vol_melt["vol_col"].map(vol_reverse)
+        vol_melt = vol_melt.drop(columns=["vol_col"])
+        t_parts = price_melt["time_str"].astype(str).str.split(":", expand=True)
+        t_h = pd.to_numeric(t_parts[0], errors="coerce").fillna(0).astype("int64")
+        t_mm = pd.to_numeric(t_parts[1], errors="coerce").fillna(0).astype("int64")
+        price_melt["time_key"] = t_h.astype(str) + ":" + t_mm.astype(str).str.zfill(2)
+        merged = price_melt.merge(
+            vol_melt,
+            on=[tc, date_col, "time_key"],
+            how="left",
+        )
+        merged = merged.drop(columns=["time_key"])
+    else:
+        merged = price_melt.copy()
+        merged["volume"] = 1.0
+
+    merged["volume"] = pd.to_numeric(merged["volume"], errors="coerce").fillna(1.0)
+    merged.loc[merged["volume"] < 0, "volume"] = 1.0
+
+    # Parse time_str -> datetime (vectorized)
+    parts = merged["time_str"].astype(str).str.split(":", expand=True)
+    h = pd.to_numeric(parts[0], errors="coerce").fillna(0).astype("int64")
+    mm = pd.to_numeric(parts[1], errors="coerce").fillna(0).astype("int64")
+    merged["datetime"] = merged[date_col] + pd.to_timedelta(h * 60 + mm, unit="m")
+    merged["open"] = merged["close"]
+    merged["high"] = merged["close"]
+    merged["low"] = merged["close"]
+
+    # Output uses "Ticker" (normalized to upper) for engine compatibility
+    merged["Ticker"] = merged[tc].astype(str).str.upper()
+    out = merged[["Ticker", date_col, "datetime", "open", "high", "low", "close", "volume"]]
     out = out.sort_values(["Ticker", "datetime"]).reset_index(drop=True)
     return out
 
@@ -142,30 +174,73 @@ def enrich_long_with_library_columns(long_df: pd.DataFrame) -> pd.DataFrame:
     return long_df
 
 
+def _enrich_one_year(
+    year: Any,
+    df: pd.DataFrame,
+    ticker_col: str,
+    date_col: str,
+) -> tuple[Any, Optional[pd.DataFrame]]:
+    """
+    Worker for parallel enrich_cleaned_year_data.
+    Returns (year, enriched_df) or (year, None) if empty/skip.
+    Preserves original year key for engine lookup.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return (year, None)
+    if date_col not in df.columns:
+        return (year, None)
+    if ticker_col not in df.columns and "ticker" not in df.columns:
+        return (year, None)
+    long_df = wide_to_long(df, ticker_col=ticker_col, date_col=date_col)
+    if long_df.empty:
+        return (year, None)
+    enriched = enrich_long_with_library_columns(long_df)
+    if enriched.empty:
+        return (year, None)
+    return (year, enriched)
+
+
 def enrich_cleaned_year_data(
     cleaned_year_data: dict[str, pd.DataFrame],
     *,
     ticker_col: str = "Ticker",
     date_col: str = "Date",
+    max_workers: Optional[int] = None,
 ) -> dict[str, pd.DataFrame]:
     """
     For each year with in-memory DataFrame, convert wide->long and run librarycolumn.
     Returns dict with same key type as cleaned_year_data (year or year_str) -> enriched_long_df.
+
+    Uses ProcessPoolExecutor to process years in parallel when max_workers > 1.
     """
-    out = {}
-    for year, df in cleaned_year_data.items():
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            continue
-        if date_col not in df.columns:
-            continue
-        if ticker_col not in df.columns and "ticker" not in df.columns:
-            continue
-        long_df = wide_to_long(df, ticker_col=ticker_col, date_col=date_col)
-        if long_df.empty:
-            continue
-        enriched = enrich_long_with_library_columns(long_df)
-        if not enriched.empty:
-            out[year] = enriched  # preserve key type so engine lookup matches cleaned_year_data
+    items = [
+        (year, df, ticker_col, date_col)
+        for year, df in cleaned_year_data.items()
+        if isinstance(df, pd.DataFrame)
+        and not df.empty
+        and date_col in df.columns
+        and (ticker_col in df.columns or "ticker" in df.columns)
+    ]
+    if not items:
+        return {}
+
+    n_years = len(items)
+    workers = max_workers if max_workers is not None else min(n_years, (os.cpu_count() or 4))
+    out: dict[str, pd.DataFrame] = {}
+
+    if workers <= 1:
+        for year, df, tc, dc in items:
+            _, enriched = _enrich_one_year(year, df, tc, dc)
+            if enriched is not None:
+                out[year] = enriched  # preserve key type for engine lookup
+        return out
+
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_enrich_one_year, year, df, tc, dc): year for year, df, tc, dc in items}
+        for future in as_completed(futures):
+            year_key, enriched = future.result()
+            if enriched is not None:
+                out[year_key] = enriched  # preserve key type
     return out
 
 
