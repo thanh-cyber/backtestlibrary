@@ -164,6 +164,8 @@ def attach_continuous_tracking(
         tr["ExitTime"] = _trade_datetime(tr["date"], tr["exit_time"])
     if "Ticker" not in tr.columns and "ticker" in tr.columns:
         tr["Ticker"] = tr["ticker"]
+    # Normalize ticker to match enriched_long (wide_to_long uppercases tickers)
+    tr[ticker_col] = tr[ticker_col].astype(str).str.upper().str.strip()
     enriched = getattr(lib, "add_continuous_tracking")(
         enriched_long_df,
         tr,

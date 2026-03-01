@@ -38,6 +38,7 @@ from .feed import (
     validate_feed,
 )
 from .io import write_trades_csv, write_trades_excel
+from .trade_enrichment import enrich_results
 from .plotting import plot_equity_drawdown, plot_result, plot_trade_pnl
 from .librarycolumn_enrichment import (
     enrich_cleaned_year_data,
@@ -85,6 +86,7 @@ __all__ = [
     "attach_exit_metrics_from_intraday_data",
     "write_trades_csv",
     "write_trades_excel",
+    "enrich_results",
     "enrich_cleaned_year_data",
     "get_row_at_time",
     "wide_to_long",

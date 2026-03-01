@@ -52,6 +52,7 @@ def _enrich_long_per_ticker_date(long_df: pd.DataFrame) -> pd.DataFrame:
         g = g.set_index("datetime")
         if not isinstance(g.index, pd.DatetimeIndex):
             g.index = pd.to_datetime(g.index, errors="coerce")
+        g = g.sort_index()  # VWAP/pandas_ta require ordered DatetimeIndex
         try:
             out = lib.add_all_columns(g, inplace=False)
         except Exception:
@@ -322,3 +323,38 @@ def enrich_trades_post_backtest(
             analyzers=result.analyzers,
         )
     return result
+
+
+def enrich_results(
+    raw_results: dict,
+    cleaned_year_data: dict,
+    config: Any,
+    *,
+    session_start: Optional[time] = None,
+    session_end: Optional[time] = None,
+) -> None:
+    """
+    Run column phase (Entry_Col_*, Exit_Col_*, Continuous_Col_*) on raw_results in place.
+    Use after engine.run(..., defer_column_phase=True).
+    """
+    if not getattr(config, "use_library_columns", True):
+        return
+    start = session_start if session_start is not None else getattr(config, "session_start")
+    end = session_end if session_end is not None else getattr(config, "session_end")
+    if start is None or end is None:
+        return
+    wide_path_by_year = {
+        k: Path(v) for k, v in cleaned_year_data.items()
+        if isinstance(v, (Path, str))
+    }
+    for year, by_acct in raw_results.items():
+        for acct, res in by_acct.items():
+            enriched = enrich_trades_post_backtest(
+                res,
+                cleaned_year_data,
+                wide_path_by_year,
+                session_start=start,
+                session_end=end,
+                config=config,
+            )
+            raw_results[year][acct] = enriched
