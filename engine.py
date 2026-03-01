@@ -289,6 +289,17 @@ class ChronologicalBacktestEngine:
             except ImportError:
                 pass
 
+        # Build enriched long for MFE/MAE/unrealized PL and Entry/Exit columns (when use_library_columns)
+        enriched_long_by_year: dict[str, pd.DataFrame] = {}
+        if self.config.use_library_columns:
+            in_memory = {k: v for k, v in iter_items if isinstance(v, pd.DataFrame)}
+            if in_memory:
+                try:
+                    from .librarycolumn_enrichment import enrich_cleaned_year_data
+                    enriched_long_by_year = enrich_cleaned_year_data(in_memory)
+                except Exception:
+                    enriched_long_by_year = {}
+
         for year, data in iter_items:
             results[year] = {}
             if isinstance(data, (Path, str)):
@@ -307,13 +318,14 @@ class ChronologicalBacktestEngine:
                     df_year["Date"] = pd.to_datetime(df_year["Date"], errors="coerce").dt.normalize()
                     df_year = df_year.dropna(subset=["Date"]).sort_values("Date")
                 daily_groups = df_year.groupby("Date")
+                enriched_long_df = enriched_long_by_year.get(str(year)) if enriched_long_by_year else None
                 for starting_account in starting_accounts:
                     run_result = self._run_single_account(
                         daily_groups,
                         starting_account,
                         strategy,
                         pbar=pbar,
-                        enriched_long_df=None,
+                        enriched_long_df=enriched_long_df,
                     )
                     if not self.config.defer_column_phase:
                         run_result = self._enrich_trades(run_result, cleaned_year_data, wide_path_by_year)
@@ -528,7 +540,12 @@ class ChronologicalBacktestEngine:
                         continue
                     # ---- Update elite exit tracking every bar ----
                     current_price = get_price(row, current_time)
+                    # ATR comes from enriched long (wide data has no Col_ATR14)
                     atr = _to_float(row.get("Col_ATR14"))
+                    if atr is None and get_row_at_time is not None and enriched_long_df is not None:
+                        row_enriched = get_row_at_time(enriched_long_df, pos.ticker, date, current_time)
+                        if row_enriched is not None:
+                            atr = _to_float(row_enriched.get("Col_ATR14"))
                     if current_price is not None and current_price > 0 and atr is not None and atr > 0:
                         current_pl_r = _pl_r_for_side(pos.side, pos.entry_price, current_price, atr)
                         if current_pl_r > pos.mfe_r:
@@ -570,6 +587,11 @@ class ChronologicalBacktestEngine:
                         still_open.append(pos)
                         continue
 
+                    row_exit_enriched = None
+                    if get_row_at_time is not None and enriched_long_df is not None:
+                        row_exit_enriched = get_row_at_time(
+                            enriched_long_df, pos.ticker, date, current_time
+                        )
                     net_pnl, trade = self._close_trade(
                         pos=pos,
                         row=row,
@@ -577,6 +599,7 @@ class ChronologicalBacktestEngine:
                         exit_time=current_time,
                         exit_price=float(signal.exit_price),
                         exit_reason=signal.reason,
+                        row_enriched=row_exit_enriched,
                     )
                     total_trades += 1
                     if net_pnl > 0:
@@ -590,13 +613,7 @@ class ChronologicalBacktestEngine:
                     trade.account_balance_after = account_balance
                     tdict = asdict(trade)
                     if self.config.use_library_columns:
-                        row_for_exit = row
-                        if get_row_at_time is not None:
-                            row_at_exit = get_row_at_time(
-                                enriched_long_df, pos.ticker, date, current_time
-                            )
-                            if row_at_exit is not None:
-                                row_for_exit = row_at_exit
+                        row_for_exit = row_exit_enriched if row_exit_enriched is not None else row
                         if pos.entry_column_snapshot:
                             tdict.update(pos.entry_column_snapshot)
                         apply_exit_columns(tdict, row_for_exit)
@@ -673,6 +690,7 @@ class ChronologicalBacktestEngine:
         exit_time: time,
         exit_price: float,
         exit_reason: str,
+        row_enriched: Optional[pd.Series] = None,
     ) -> tuple[float, TradeRecord]:
         entry_value = pos.shares * pos.entry_price
         exit_value = pos.shares * exit_price
@@ -724,8 +742,9 @@ class ChronologicalBacktestEngine:
         trade.Col_BarsToMFE = int(pos.bars_to_mfe)
         trade.Col_BarsToMAE = int(pos.bars_to_mae)
         trade.Col_MaxDrawdownFromMFE_R = float(pos.max_dd_from_mfe)
-        atr = _to_float(row.get("Col_ATR14"))
-        vwap = _to_float(row.get("Col_VWAP"))
+        r = row_enriched if row_enriched is not None else row
+        atr = _to_float(r.get("Col_ATR14"))
+        vwap = _to_float(r.get("Col_VWAP"))
         trade.Exit_Col_ATR14 = float(atr) if atr is not None else 0.0
         trade.Exit_Col_VWAP = float(vwap) if vwap is not None else 0.0
         if atr is not None and atr > 0 and pos.shares != 0:
