@@ -54,6 +54,11 @@ from .columns import (
     get_continuous_columns,
     has_librarycolumn,
 )
+from .column_definitions import (
+    ENTRY_COLUMNS,
+    EXIT_SNAPSHOT_COLUMNS,
+    CONTINUOUS_TRACKING_COLUMNS,
+)
 
 __all__ = [
     "Analyzer",
@@ -106,4 +111,7 @@ __all__ = [
     "get_exit_columns",
     "get_continuous_columns",
     "has_librarycolumn",
+    "ENTRY_COLUMNS",
+    "EXIT_SNAPSHOT_COLUMNS",
+    "CONTINUOUS_TRACKING_COLUMNS",
 ]

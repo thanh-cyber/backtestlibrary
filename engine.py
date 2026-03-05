@@ -12,7 +12,12 @@ import pandas as pd
 from .bt_types import Position, RunResult, Strategy, TradeRecord
 from .analyzers import build_full_metrics
 from .sizers import RiskSizer
-from .columns import apply_entry_columns, apply_exit_columns
+from .columns import (
+    apply_entry_columns,
+    apply_exit_columns,
+    get_continuous_columns,
+    CONTINUOUS_COLUMN_PREFIX,
+)
 from .trade_enrichment import enrich_trades_post_backtest
 
 
@@ -66,6 +71,13 @@ def _to_float(value) -> Optional[float]:
     return x if np.isfinite(x) else None
 
 
+def _get_atr_vwap_from_row(row: pd.Series, t: time) -> tuple[Optional[float], Optional[float]]:
+    """Get ATR14 and VWAP for bar at time t from Col_ATR14/Col_VWAP only. No fallback."""
+    atr = _to_float(row.get("Col_ATR14"))
+    vwap = _to_float(row.get("Col_VWAP"))
+    return (atr, vwap)
+
+
 # Target times (hour, minute) for unrealized PL snapshots. Capture at first bar >= target.
 _UNREALIZED_SNAPSHOT_TARGETS: list[tuple[int, int, str]] = [
     (10, 0, "1000"), (10, 30, "1030"), (11, 0, "1100"), (11, 30, "1130"),
@@ -111,34 +123,10 @@ def _time_candidates(t: time) -> list[object]:
     ]
 
 
-def _time_candidates_utc_fallback(t: time) -> list[str]:
-    """Polygon flat files: cache may use UTC column names (9:30 ET = 14:30 UTC EST, 13:30 EDT)."""
-    out = []
-    for offset in (5, 4):
-        uh = (t.hour + offset) % 24
-        out.append(f"{uh}:{t.minute:02d}")
-        out.append(f"{uh:02d}:{t.minute:02d}")
-    return out
-
-
 def get_row_price(row: pd.Series, t: time) -> Optional[float]:
-    """Robustly read a bar price from wide time-column row."""
+    """Read bar price from wide time-column row. ET time columns only; no fallback."""
     candidates = _time_candidates(t)
     for c in candidates:
-        if c in row.index:
-            px = _to_float(row[c])
-            if px is not None and px > 0:
-                return px
-    # Fallback for mixed string types
-    str_candidates = {str(c) for c in candidates}
-    for col in row.index:
-        col_str = str(col)
-        if col_str in str_candidates or any(col_str.endswith(sc) for sc in str_candidates):
-            px = _to_float(row[col])
-            if px is not None and px > 0:
-                return px
-    # Polygon/cache: try UTC column names (9:30 ET -> 14:30 or 13:30 UTC)
-    for c in _time_candidates_utc_fallback(t):
         if c in row.index:
             px = _to_float(row[c])
             if px is not None and px > 0:
@@ -174,21 +162,10 @@ def _build_day_price_cache(
                 chosen_col = cand
                 break
         if chosen_col is None:
-            # Fallback by string-equality for odd spreadsheet column types.
-            cand_str = {str(c) for c in _time_candidates(t)}
-            for col in day_df.columns:
-                col_s = str(col)
-                if col_s in cand_str or any(col_s.endswith(cs) for cs in cand_str):
-                    chosen_col = col
-                    break
-        if chosen_col is None:
-            # Polygon/cache: try UTC column names (9:30 ET -> 14:30 or 13:30 UTC)
-            for c in _time_candidates_utc_fallback(t):
-                if c in day_df.columns:
-                    chosen_col = c
-                    break
-        if chosen_col is None:
-            continue
+            raise ValueError(
+                f"Missing time column for {t.hour}:{t.minute:02d}. "
+                "Wide data must have ET time columns (e.g. 9:30, 9:31). No fallback."
+            )
         col_values = _to_float_series(day_df[chosen_col]).to_numpy(dtype=float, na_value=np.nan)
         matrix[:, col_pos] = col_values
 
@@ -239,11 +216,14 @@ class ChronologicalBacktestEngine:
         starting_accounts: list[int],
         chunk_days: int = 21,
         show_progress: bool = False,
+        enriched_long_by_year: Optional[dict[str, pd.DataFrame]] = None,
     ) -> tuple[dict[str, dict[int, RunResult]], pd.DataFrame, dict[tuple[str, int], list[float]]]:
         """Run backtest per year/account; returns (results, metrics_df, equity_curves).
         When a value is a Path (stream_from_cache), the year is read in date-chunks to avoid loading full year in RAM.
         chunk_days: number of trading days per chunk when streaming from Path (default 21 ~ 1 month).
         show_progress: if True, show a tqdm progress bar (0-100% by day or chunk).
+        enriched_long_by_year: optional dict[year_str, long DataFrame]. If provided, used for Entry/Exit/Continuous
+          instead of building from in-memory wide data. Use when streaming from path but you have pre-built long.
         Entry/Exit/Continuous columns are applied in a post-backtest enrichment pass.
         """
         results: dict[str, dict[int, RunResult]] = {}
@@ -261,12 +241,9 @@ class ChronologicalBacktestEngine:
                 if isinstance(data, (Path, str)):
                     path = Path(data)
                     path_str = str(path.resolve())
-                    try:
-                        dates_df = pd.read_parquet(path_str, columns=["Date"])
-                    except Exception:
-                        dates_df = pd.read_parquet(path_str)
+                    dates_df = pd.read_parquet(path_str, columns=["Date"], engine="pyarrow")
                     if "Date" not in dates_df.columns:
-                        continue
+                        raise ValueError(f"Parquet {path_str} has no 'Date' column.")
                     dates_df["Date"] = pd.to_datetime(dates_df["Date"], errors="coerce").dt.normalize()
                     n_dates = dates_df["Date"].dropna().nunique()
                     n_chunks = (n_dates + chunk_days - 1) // chunk_days if n_dates else 0
@@ -283,30 +260,27 @@ class ChronologicalBacktestEngine:
                     total_steps += n_days * len(starting_accounts)
         pbar = None
         if show_progress and total_steps > 0:
-            try:
-                from tqdm.auto import tqdm
-                pbar = tqdm(total=total_steps, desc="Backtest", unit="day")
-            except ImportError:
-                pass
+            from tqdm.auto import tqdm
+            pbar = tqdm(total=total_steps, desc="Backtest", unit="day")
 
         # Build enriched long for MFE/MAE/unrealized PL and Entry/Exit columns (when use_library_columns)
-        enriched_long_by_year: dict[str, pd.DataFrame] = {}
-        if self.config.use_library_columns:
+        if enriched_long_by_year is None:
+            enriched_long_by_year = {}
+        if self.config.use_library_columns and not enriched_long_by_year:
             in_memory = {k: v for k, v in iter_items if isinstance(v, pd.DataFrame)}
             if in_memory:
-                try:
-                    from .librarycolumn_enrichment import enrich_cleaned_year_data
-                    enriched_long_by_year = enrich_cleaned_year_data(in_memory)
-                except Exception:
-                    enriched_long_by_year = {}
+                from .librarycolumn_enrichment import enrich_cleaned_year_data
+                enriched_long_by_year = enrich_cleaned_year_data(in_memory)
 
         for year, data in iter_items:
             results[year] = {}
             if isinstance(data, (Path, str)):
                 path = Path(data)
+                enriched_long_df = enriched_long_by_year.get(str(year)) if enriched_long_by_year else None
                 for starting_account in starting_accounts:
                     run_result = self._run_single_account_streamed(
-                        path, starting_account, strategy, chunk_days, pbar=pbar
+                        path, starting_account, strategy, chunk_days, pbar=pbar,
+                        enriched_long_df=enriched_long_df,
                     )
                     if not self.config.defer_column_phase:
                         run_result = self._enrich_trades(run_result, cleaned_year_data, wide_path_by_year)
@@ -359,26 +333,15 @@ class ChronologicalBacktestEngine:
         strategy: Strategy,
         chunk_days: int,
         pbar: Optional[Any] = None,
+        enriched_long_df: Optional[pd.DataFrame] = None,
     ) -> RunResult:
         """Run backtest for one account by reading parquet in date-chunks; merge results."""
         path = Path(path)
         path_str = str(path.resolve())
         # Get unique dates without loading full file (read only Date column)
-        try:
-            dates_df = pd.read_parquet(path_str, columns=["Date"])
-        except Exception:
-            dates_df = pd.read_parquet(path_str)
-            if "Date" not in dates_df.columns:
-                return RunResult(
-                    final_balance=float(starting_account),
-                    total_return_pct=0.0,
-                    total_trades=0,
-                    winning_trades=0,
-                    losing_trades=0,
-                    total_pnl=0.0,
-                    trades=pd.DataFrame(),
-                    daily_equity=[float(starting_account)],
-                )
+        dates_df = pd.read_parquet(path_str, columns=["Date"], engine="pyarrow")
+        if "Date" not in dates_df.columns:
+            raise ValueError(f"Parquet {path_str} has no 'Date' column.")
         dates_df["Date"] = pd.to_datetime(dates_df["Date"], errors="coerce").dt.normalize()
         unique_dates = sorted(dates_df["Date"].dropna().unique().tolist())
         del dates_df
@@ -399,20 +362,20 @@ class ChronologicalBacktestEngine:
         for i in range(0, len(unique_dates), chunk_days):
             chunk_dates = unique_dates[i : i + chunk_days]
             d_min, d_max = chunk_dates[0], chunk_dates[-1]
-            try:
-                df_chunk = pd.read_parquet(path_str, filters=[("Date", ">=", d_min), ("Date", "<=", d_max)])
-            except Exception:
-                df_chunk = pd.read_parquet(path_str)
-                df_chunk = df_chunk[
-                    (pd.to_datetime(df_chunk["Date"], errors="coerce").dt.normalize() >= pd.Timestamp(d_min))
-                    & (pd.to_datetime(df_chunk["Date"], errors="coerce").dt.normalize() <= pd.Timestamp(d_max))
-                ]
+            df_chunk = pd.read_parquet(
+                path_str,
+                filters=[("Date", ">=", d_min), ("Date", "<=", d_max)],
+                engine="pyarrow",
+            )
             if df_chunk.empty:
                 continue
             df_chunk["Date"] = pd.to_datetime(df_chunk["Date"], errors="coerce").dt.normalize()
             df_chunk = df_chunk.dropna(subset=["Date"]).sort_values("Date")
             daily_groups = df_chunk.groupby("Date")
-            run = self._run_single_account(daily_groups, int(round(balance)), strategy, pbar=None)
+            run = self._run_single_account(
+                daily_groups, int(round(balance)), strategy, pbar=None,
+                enriched_long_df=enriched_long_df,
+            )
             all_trades.extend(run.trades.to_dict("records") if not run.trades.empty else [])
             balance = run.final_balance
             if run.daily_equity:
@@ -504,15 +467,35 @@ class ChronologicalBacktestEngine:
                     entry_column_snapshot: Optional[dict] = None
                     if self.config.use_library_columns:
                         row_for_entry = row
-                        if get_row_at_time is not None:
+                        if get_row_at_time is not None and enriched_long_df is not None:
                             row_at_entry = get_row_at_time(
                                 enriched_long_df, entry.ticker, date, entry.entry_time
                             )
                             if row_at_entry is not None:
                                 row_for_entry = row_at_entry
+                        atr_val, vwap_val = row_for_entry.get("Col_ATR14"), row_for_entry.get("Col_VWAP")
+                        if atr_val is None or vwap_val is None or (hasattr(pd, "isna") and (pd.isna(atr_val) or pd.isna(vwap_val))):
+                            atr_e, vwap_e = _get_atr_vwap_from_row(row_for_entry, entry.entry_time)
+                            row_for_entry = row_for_entry.copy()
+                            if atr_e is not None:
+                                row_for_entry["Col_ATR14"] = atr_e
+                            if vwap_e is not None:
+                                row_for_entry["Col_VWAP"] = vwap_e
                         entry_column_snapshot = {}
                         apply_entry_columns(entry_column_snapshot, row_for_entry)
                         entry_column_snapshot = entry_column_snapshot.copy()
+
+                    # Init continuous tracking from entry bar (when library has continuous columns)
+                    cont_cols = get_continuous_columns() if self.config.use_library_columns else []
+                    _continuous_entry = {}
+                    _continuous_max = {}
+                    _continuous_min = {}
+                    for col in cont_cols:
+                        v = _to_float(row_for_entry.get(col))
+                        if v is not None:
+                            _continuous_entry[col] = v
+                            _continuous_max[col] = v
+                            _continuous_min[col] = v
 
                     open_positions.append(
                         Position(
@@ -527,6 +510,9 @@ class ChronologicalBacktestEngine:
                             metadata=entry.metadata,
                             starting_account=float(starting_account),
                             entry_column_snapshot=entry_column_snapshot,
+                            _continuous_entry=_continuous_entry,
+                            _continuous_max=_continuous_max,
+                            _continuous_min=_continuous_min,
                         )
                     )
                     available_balance -= required_margin
@@ -540,12 +526,8 @@ class ChronologicalBacktestEngine:
                         continue
                     # ---- Update elite exit tracking every bar ----
                     current_price = get_price(row, current_time)
-                    # ATR comes from enriched long (wide data has no Col_ATR14)
-                    atr = _to_float(row.get("Col_ATR14"))
-                    if atr is None and get_row_at_time is not None and enriched_long_df is not None:
-                        row_enriched = get_row_at_time(enriched_long_df, pos.ticker, date, current_time)
-                        if row_enriched is not None:
-                            atr = _to_float(row_enriched.get("Col_ATR14"))
+                    # ATR/VWAP from row only (Col_ATR14/Col_VWAP). No fallback.
+                    atr, vwap_bar = _get_atr_vwap_from_row(row, current_time)
                     if current_price is not None and current_price > 0 and atr is not None and atr > 0:
                         current_pl_r = _pl_r_for_side(pos.side, pos.entry_price, current_price, atr)
                         if current_pl_r > pos.mfe_r:
@@ -564,6 +546,20 @@ class ChronologicalBacktestEngine:
                             if current_min >= target_min and key not in pos._unrealized_captured:
                                 setattr(pos, f"unrealized_pl_{key}", current_pl_r)
                                 pos._unrealized_captured.add(key)
+
+                    # Continuous_Col_*: update max/min and capture At30min/At60min from enriched bar
+                    if get_row_at_time is not None and enriched_long_df is not None and self.config.use_library_columns:
+                        row_enriched_cur = get_row_at_time(enriched_long_df, pos.ticker, date, current_time)
+                        if row_enriched_cur is not None:
+                            for col in get_continuous_columns():
+                                v = _to_float(row_enriched_cur.get(col))
+                                if v is not None:
+                                    pos._continuous_max[col] = max(pos._continuous_max.get(col, v), v)
+                                    pos._continuous_min[col] = min(pos._continuous_min.get(col, v), v)
+                                    if pos.bars_since_entry == 29:
+                                        pos._continuous_at_30[col] = v
+                                    if pos.bars_since_entry == 59:
+                                        pos._continuous_at_60[col] = v
 
                     # Increment bar counter once per processed bar while position is open.
                     pos.bars_since_entry += 1
@@ -592,6 +588,11 @@ class ChronologicalBacktestEngine:
                         row_exit_enriched = get_row_at_time(
                             enriched_long_df, pos.ticker, date, current_time
                         )
+                    if row_exit_enriched is not None and self.config.use_library_columns:
+                        for col in get_continuous_columns():
+                            v = _to_float(row_exit_enriched.get(col))
+                            if v is not None:
+                                pos._continuous_exit[col] = v
                     net_pnl, trade = self._close_trade(
                         pos=pos,
                         row=row,
@@ -617,6 +618,19 @@ class ChronologicalBacktestEngine:
                         if pos.entry_column_snapshot:
                             tdict.update(pos.entry_column_snapshot)
                         apply_exit_columns(tdict, row_for_exit)
+                        for col in get_continuous_columns():
+                            if col in pos._continuous_entry:
+                                tdict[f"{CONTINUOUS_COLUMN_PREFIX}{col}_Entry"] = pos._continuous_entry[col]
+                            if col in pos._continuous_exit:
+                                tdict[f"{CONTINUOUS_COLUMN_PREFIX}{col}_Exit"] = pos._continuous_exit[col]
+                            if col in pos._continuous_max:
+                                tdict[f"{CONTINUOUS_COLUMN_PREFIX}{col}_Max"] = pos._continuous_max[col]
+                            if col in pos._continuous_min:
+                                tdict[f"{CONTINUOUS_COLUMN_PREFIX}{col}_Min"] = pos._continuous_min[col]
+                            if col in pos._continuous_at_30:
+                                tdict[f"{CONTINUOUS_COLUMN_PREFIX}{col}_At30min"] = pos._continuous_at_30[col]
+                            if col in pos._continuous_at_60:
+                                tdict[f"{CONTINUOUS_COLUMN_PREFIX}{col}_At60min"] = pos._continuous_at_60[col]
                     trades_list.append(tdict)
 
                     if account_balance <= 0:
@@ -743,8 +757,7 @@ class ChronologicalBacktestEngine:
         trade.Col_BarsToMAE = int(pos.bars_to_mae)
         trade.Col_MaxDrawdownFromMFE_R = float(pos.max_dd_from_mfe)
         r = row_enriched if row_enriched is not None else row
-        atr = _to_float(r.get("Col_ATR14"))
-        vwap = _to_float(r.get("Col_VWAP"))
+        atr, vwap = _get_atr_vwap_from_row(r, exit_time)
         trade.Exit_Col_ATR14 = float(atr) if atr is not None else 0.0
         trade.Exit_Col_VWAP = float(vwap) if vwap is not None else 0.0
         if atr is not None and atr > 0 and pos.shares != 0:

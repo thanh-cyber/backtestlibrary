@@ -153,7 +153,10 @@ def wide_to_long(
 
 def enrich_long_with_library_columns(long_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Run librarycolumn's add_all_columns (or add_all_missing_indicators) on long DataFrame.
+    Run librarycolumn full pipeline so the long DataFrame gets all Col_* for
+    ENTRY_COLUMNS (148), EXIT_SNAPSHOT_COLUMNS (171), CONTINUOUS_TRACKING_COLUMNS (20 base).
+    No fallback: uses add_full_enrichment, or add_all_columns + add_all_missing_indicators;
+    raises if enrichment fails.
 
     Expects columns: Ticker, datetime, open, high, low, close, volume (lowercase).
     """
@@ -161,17 +164,17 @@ def enrich_long_with_library_columns(long_df: pd.DataFrame) -> pd.DataFrame:
         return long_df
     try:
         import column_library as lib
-    except ImportError:
-        try:
-            from backtestlibrary.librarycolumn import column_library as lib
-        except ImportError:
-            return long_df
+    except ImportError as e:
+        raise ImportError("enrich_long_with_library_columns requires column_library (librarycolumn). Install with: pip install librarycolumn") from e
 
+    if hasattr(lib, "add_full_enrichment"):
+        return lib.add_full_enrichment(long_df)
+    if hasattr(lib, "add_all_columns") and hasattr(lib, "add_all_missing_indicators"):
+        out = lib.add_all_columns(long_df, inplace=False)
+        return lib.add_all_missing_indicators(out)
     if hasattr(lib, "add_all_columns"):
         return lib.add_all_columns(long_df, inplace=False)
-    if hasattr(lib, "add_all_missing_indicators"):
-        return lib.add_all_missing_indicators(long_df)
-    return long_df
+    raise RuntimeError("column_library has no add_full_enrichment, add_all_columns, or add_all_missing_indicators")
 
 
 def _enrich_one_year(
@@ -278,9 +281,94 @@ def get_row_at_time(
     return subset.iloc[0]
 
 
+def report_entry_exit_column_gaps(
+    enriched_long_columns: list,
+    *,
+    verbose: bool = True,
+    include_continuous: bool = True,
+) -> dict:
+    """
+    Compare expected entry/exit/continuous columns (from column_library) to the columns
+    present in the enriched long DataFrame. Use before running the backtest to
+    see which columns enrichment did not produce (so they will be NaN in output).
+
+    Note: "Entry" and "Exit" here are only the library snapshot columns (Entry_Col_*, Exit_Col_*)
+    taken from the enriched long at entry/exit time. Engine-added exit-only columns
+    (e.g. Col_MaxFavorableExcursion_R, Col_MAE_R) are computed by the engine and are not in this list.
+
+    Args:
+        enriched_long_columns: list of column names from the enriched long (e.g. df.columns.tolist()).
+        verbose: if True, print a short summary to stdout.
+        include_continuous: if True, also report continuous-tracking columns expected vs present.
+
+    Returns:
+        dict with keys: entry_expected, exit_expected, entry_missing_from_long, exit_missing_from_long,
+        entry_count, exit_count, entry_missing_count, exit_missing_count; and if include_continuous:
+        continuous_expected, continuous_missing_from_long, continuous_count, continuous_missing_count;
+        engine_exit_only_columns, engine_exit_only_count.
+    """
+    from .columns import get_entry_columns, get_exit_columns, get_continuous_columns
+    from .io import get_engine_exit_only_columns
+
+    set_long = set(c for c in enriched_long_columns if isinstance(c, str))
+    entry_expected = get_entry_columns()
+    exit_expected = get_exit_columns()
+    engine_exit_only = get_engine_exit_only_columns()
+    entry_missing = [c for c in entry_expected if c not in set_long]
+    exit_missing = [c for c in exit_expected if c not in set_long]
+    out = {
+        "entry_expected": entry_expected,
+        "exit_expected": exit_expected,
+        "entry_missing_from_long": entry_missing,
+        "exit_missing_from_long": exit_missing,
+        "entry_count": len(entry_expected),
+        "exit_count": len(exit_expected),
+        "entry_missing_count": len(entry_missing),
+        "exit_missing_count": len(exit_missing),
+        "engine_exit_only_columns": engine_exit_only,
+        "engine_exit_only_count": len(engine_exit_only),
+    }
+    if include_continuous:
+        continuous_expected = get_continuous_columns()
+        continuous_missing = [c for c in continuous_expected if c not in set_long]
+        out["continuous_expected"] = continuous_expected
+        out["continuous_missing_from_long"] = continuous_missing
+        out["continuous_count"] = len(continuous_expected)
+        out["continuous_missing_count"] = len(continuous_missing)
+    if verbose:
+        entry_tip = (entry_missing[:15] + ["..."]) if len(entry_missing) > 15 else entry_missing
+        exit_tip = (exit_missing[:15] + ["..."]) if len(exit_missing) > 15 else exit_missing
+        lines = [
+            "Entry/Exit/Continuous column gaps (expected vs present in enriched long):",
+            "  (Entry/Exit = library snapshot columns only; engine exit-only columns are added at close.)",
+            f"  Entry: {len(entry_expected)} expected, {len(entry_missing)} missing from long"
+            + (f" → {entry_tip}" if entry_missing else ""),
+            f"  Exit:  {len(exit_expected)} expected, {len(exit_missing)} missing from long"
+            + (f" → {exit_tip}" if exit_missing else ""),
+        ]
+        if include_continuous:
+            cont_tip = (continuous_missing[:15] + ["..."]) if len(continuous_missing) > 15 else continuous_missing
+            # 6 output columns per base: Entry, Exit, Max, Min, At30min, At60min (engine + Phase 2)
+            n_continuous_output = len(continuous_expected) * 6
+            lines.append(
+                f"  Continuous: {len(continuous_expected)} base expected, {len(continuous_missing)} missing from long"
+                + (f" → {cont_tip}" if continuous_missing else "")
+                + f" (→ {n_continuous_output} output columns: Entry/Exit/Max/Min/At30min/At60min each)"
+            )
+        # Engine exit-only: not in long; added by engine at close → total exit cols = exit_count + engine_exit_only_count
+        lines.append(
+            f"  Engine exit-only (added at close, not in long): {len(engine_exit_only)} columns"
+            f" → total exit columns = {len(exit_expected)} + {len(engine_exit_only)} = {len(exit_expected) + len(engine_exit_only)}"
+        )
+        lines.append("  " + ", ".join(engine_exit_only[:8]) + (" ..." if len(engine_exit_only) > 8 else ""))
+        print("\n".join(lines))
+    return out
+
+
 __all__ = [
     "wide_to_long",
     "enrich_long_with_library_columns",
     "enrich_cleaned_year_data",
     "get_row_at_time",
+    "report_entry_exit_column_gaps",
 ]

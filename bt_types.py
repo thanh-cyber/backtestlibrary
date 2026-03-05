@@ -46,6 +46,13 @@ class Position:
     bars_since_entry: int = 0
     starting_account: float = 0.0
     _unrealized_captured: set = field(default_factory=set)  # keys captured for "first bar >= target"
+    # Continuous_Col_* tracking (Entry/Exit/Max/Min/At30min/At60min) during backtest
+    _continuous_entry: Dict[str, float] = field(default_factory=dict)
+    _continuous_max: Dict[str, float] = field(default_factory=dict)
+    _continuous_min: Dict[str, float] = field(default_factory=dict)
+    _continuous_at_30: Dict[str, float] = field(default_factory=dict)
+    _continuous_at_60: Dict[str, float] = field(default_factory=dict)
+    _continuous_exit: Dict[str, float] = field(default_factory=dict)  # set at exit bar
     unrealized_pl_1000: float = 0.0
     unrealized_pl_1030: float = 0.0
     unrealized_pl_1100: float = 0.0
