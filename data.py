@@ -22,6 +22,21 @@ def _get_tqdm():
         return None
 
 
+def _progress_print_iter(items, desc, total=None):
+    """Yield items and print progress to stdout so it's visible in Jupyter/Cursor/VS Code."""
+    items = list(items)
+    total = total or len(items)
+    if total == 0:
+        return
+    last_pct = -1
+    for i, x in enumerate(items):
+        pct = (100 * (i + 1)) // total
+        if pct != last_pct and (pct % 10 == 0 or pct == 100 or i == 0):
+            print(f"{desc}: {pct}% ({i + 1}/{total})", flush=True)
+            last_pct = pct
+        yield x
+
+
 @dataclass
 class ParquetLoaderConfig:
     """Config for loading parquet flat files (e.g. parquet2 folder)."""
@@ -33,13 +48,16 @@ class ParquetLoaderConfig:
     chunk_size: int = 5  # pivot per-file, concat wide in batches; smaller = less peak memory
     stream_to_disk: bool = True  # write batches to temp parquet, avoid holding full year in RAM
     stream_from_cache: bool = True  # when True (default), return dict[str, Path] after building cache to avoid loading full year in RAM (prevents freeze/OOM)
+    # Session (hour, minute) ET: only these minute columns are kept in wide cache.
+    session_start: tuple[int, int] = (9, 30)  # e.g. (9, 30) = 9:30 AM, (4, 0) = 4:00 AM
+    session_end: tuple[int, int] = (16, 0)    # e.g. (16, 0) = 4:00 PM, (9, 30) = 9:30 AM
     ticker_col: str = "ticker"
     timestamp_col: str = "window_start"
     price_col: str = "close"
     volume_col: str = "volume"
     high_col: Optional[str] = "high"  # if set, pivot to "High 9:30" etc. for ORB/strategies that need bar high
     low_col: Optional[str] = "low"  # if set, pivot to "Low 9:30" etc.
-    open_col: Optional[str] = None  # if set, pivot to "Open 9:30" etc. (optional to avoid extra columns)
+    open_col: Optional[str] = "open"  # if set, pivot to "Open 9:30" etc. for full OHLC bar data
 
 
 @dataclass
@@ -362,7 +380,9 @@ class ParquetDataLoader:
 
         tqdm_fn = _get_tqdm() if self.config.show_progress else None
         out: dict[str, pd.DataFrame] = {}
-        standard_cols = _standard_minute_columns((9, 30), (16, 0))
+        start = getattr(self.config, "session_start", (9, 30))
+        end = getattr(self.config, "session_end", (16, 0))
+        standard_cols = _standard_minute_columns(start, end)
 
         chunk_size = max(1, self.config.chunk_size)
         stream_to_disk = getattr(self.config, "stream_to_disk", True)
@@ -372,7 +392,10 @@ class ParquetDataLoader:
             if years_filter is not None and year not in years_filter:
                 continue
             paths = year_to_paths[year]
-            iter_paths = tqdm_fn(paths, desc=f"Load {year}", unit="file") if tqdm_fn else paths
+            if self.config.show_progress:
+                iter_paths = _progress_print_iter(paths, f"Load {year}", len(paths))
+            else:
+                iter_paths = paths
 
             wide_chunks: list[pd.DataFrame] = []
             temp_files: list[str] = []
@@ -418,7 +441,10 @@ class ParquetDataLoader:
                     continue
                 wide_one["Date"] = pd.to_datetime(wide_one["Date"], errors="coerce").dt.normalize()
                 wide_one = wide_one.dropna(subset=["Ticker", "Date"])
-                wide_one = _filter_wide_to_standard_columns(wide_one, standard_cols)
+                keep_open = bool(getattr(self.config, "open_col", None))
+                wide_one = _filter_wide_to_standard_columns(wide_one, standard_cols, keep_open=keep_open)
+                # Avoid duplicate column names (PyArrow rejects them when merging)
+                wide_one = wide_one.loc[:, ~wide_one.columns.duplicated()]
                 wide_chunks.append(wide_one)
 
                 if len(wide_chunks) >= chunk_size:
@@ -468,16 +494,63 @@ class ParquetDataLoader:
                 if pa is not None and pq is not None:
                     writer = None
                     tqdm_fn = _get_tqdm()
-                    merge_iter = tqdm_fn(temp_files, desc=f"Merge {year} to cache", unit="part") if tqdm_fn and self.config.show_progress else temp_files
+                    if self.config.show_progress:
+                        merge_iter = _progress_print_iter(temp_files, f"Merge {year} to cache", len(temp_files))
+                    else:
+                        merge_iter = temp_files
+                    use_pandas_merge = False
+                    schema_names: list[str] | None = None
                     for f in merge_iter:
                         tbl = pq.read_table(f)
+                        # PyArrow rejects duplicate column names; unify column names if needed
+                        if tbl.column_names != list(dict.fromkeys(tbl.column_names)):
+                            use_pandas_merge = True
+                            del tbl
+                            break
                         if writer is None:
                             writer = pq.ParquetWriter(str(merge_path), tbl.schema)
-                        writer.write_table(tbl)
+                            schema_names = list(tbl.column_names)
+                        else:
+                            # Allow parts with identical columns but different order.
+                            # Some batches (e.g., early-close days) can produce different pivot column ordering.
+                            if schema_names is not None and list(tbl.column_names) != schema_names:
+                                if set(tbl.column_names) == set(schema_names):
+                                    tbl = tbl.select(schema_names)
+                        try:
+                            writer.write_table(tbl)
+                        except (ValueError, Exception):
+                            use_pandas_merge = True
+                            if writer is not None:
+                                try:
+                                    writer.close()
+                                except Exception:
+                                    pass
+                                writer = None
+                                if merge_path.exists():
+                                    try:
+                                        merge_path.unlink()
+                                    except OSError:
+                                        pass
+                            del tbl
+                            break
                         del tbl
                         gc.collect()
-                    if writer is not None:
+                    if not use_pandas_merge and writer is not None:
                         writer.close()
+                    if use_pandas_merge:
+                        # Fallback: concat in pandas (handles schema/duplicate column differences)
+                        result = None
+                        for tf in temp_files:
+                            part = pd.read_parquet(tf)
+                            part = part.loc[:, ~part.columns.duplicated()]
+                            result = part if result is None else pd.concat([result, part], ignore_index=True, copy=False)
+                            del part
+                            gc.collect()
+                        if result is not None and not result.empty:
+                            result = result.loc[:, ~result.columns.duplicated()]
+                            result.to_parquet(merge_path, index=False)
+                        del result
+                        gc.collect()
                     stream_only = getattr(self.config, "stream_from_cache", True) and bool(cache_dir)
                     if stream_only:
                         out[str(year)] = merge_path

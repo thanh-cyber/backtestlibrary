@@ -2,6 +2,8 @@
 
 Reusable, strategy-agnostic backtesting backbone for consistent research runs.
 
+**Recent changes:** See [CHANGELOG.md](CHANGELOG.md) for a full description of changes (optional-deps robustness, sparse intraday handling, exit-column behavior, and earlier history).
+
 ## Install (editable for development)
 
 ```bash
