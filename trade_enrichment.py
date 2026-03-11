@@ -24,7 +24,7 @@ from .librarycolumn_enrichment import (
     get_row_at_time,
     wide_to_long,
 )
-from .columns import apply_entry_columns, apply_exit_columns, attach_continuous_tracking
+from .columns import apply_entry_columns, apply_exit_columns, attach_continuous_tracking, has_librarycolumn
 
 # Unrealized P&L snapshot times (must match engine)
 _UNREALIZED_SNAPSHOT_TARGETS: list[tuple[int, int, str]] = [
@@ -593,6 +593,8 @@ def enrich_trades_post_backtest(
     """
     if not getattr(config, "use_library_columns", True):
         return result
+    if not has_librarycolumn():
+        return result
     trades = result.trades
     if trades is None or trades.empty:
         return result
@@ -643,8 +645,10 @@ def enrich_trades_post_backtest(
         cache_path_obj.mkdir(parents=True, exist_ok=True)
     tqdm = None
     if show_progress:
-        from tqdm.auto import tqdm
-
+        try:
+            from tqdm.auto import tqdm
+        except Exception:
+            tqdm = None
     tr["_orig_idx"] = np.arange(len(tr))
     pbar = tqdm(total=100, desc="Phase 2", unit="%") if (tqdm and show_progress) else None
     per_year_enriched: list[pd.DataFrame] = []
@@ -894,7 +898,10 @@ def enrich_results(
     n = len(items)
     tqdm = None
     if n:
-        from tqdm.auto import tqdm
+        try:
+            from tqdm.auto import tqdm
+        except Exception:
+            tqdm = None
     pbar = tqdm(total=100, desc="Phase 2", unit="%") if (tqdm and n) else None
     try:
         for year, by_acct in raw_results.items():

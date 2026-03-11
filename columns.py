@@ -96,23 +96,20 @@ def apply_exit_columns(trade_dict: dict, row: pd.Series) -> None:
     """
     Mutate trade_dict to add Exit_Col_X for each X in get_exit_columns() from row.
     Call this with the exit bar row before appending the trade to trades_list.
-    Always adds every expected column so output has a full set; uses float('nan') when value is missing/invalid.
+    Only adds keys when the value is present and valid; skips missing/invalid so trade dicts stay clean.
     """
     for col in get_exit_columns():
         key = f"{EXIT_COLUMN_PREFIX}{col}"
         val = row.get(col)
         if val is None or (hasattr(pd, "isna") and pd.isna(val)):
-            trade_dict[key] = float("nan")
             continue
         try:
             v = float(val)
         except (TypeError, ValueError):
-            trade_dict[key] = float("nan")
             continue
         if v != v or abs(v) == float("inf"):
-            trade_dict[key] = float("nan")
-        else:
-            trade_dict[key] = v
+            continue
+        trade_dict[key] = v
 
 
 def _trade_datetime(date_series: pd.Series, time_series: pd.Series) -> pd.Series:

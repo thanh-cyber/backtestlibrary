@@ -16,9 +16,22 @@ from .columns import (
     apply_entry_columns,
     apply_exit_columns,
     get_continuous_columns,
+    has_librarycolumn,
     CONTINUOUS_COLUMN_PREFIX,
 )
 from .trade_enrichment import enrich_trades_post_backtest
+
+
+def _date_to_naive_for_parquet_filter(d):
+    """Convert a date/timestamp to timezone-naive for use in PyArrow parquet filters.
+    PyArrow can misbehave when filter values are tz-aware and the column is naive (or vice versa)."""
+    if d is None:
+        return d
+    if hasattr(d, "tz") and getattr(d, "tz", None) is not None:
+        return d.tz_localize(None)
+    if hasattr(d, "tzinfo") and getattr(d, "tzinfo", None) is not None:
+        return d.replace(tzinfo=None)
+    return d
 
 
 @dataclass
@@ -43,6 +56,11 @@ class BacktestConfig:
     exit_price_col: str = "Exit_Price"
     use_library_columns: bool = True  # When True, engine runs entry/exit columns from librarycolumn at entry/exit time; default on so columns are always included
     defer_column_phase: bool = False  # When True, engine skips enrichment; run enrich_results(raw_results, ...) in a separate cell
+    # Diagnostic callbacks: on_entry_taken(entry, date), on_entry_skipped(entry, date, reason). reason: "row_missing"|"shares_zero"|"margin_insufficient"
+    on_entry_taken: Optional[Any] = None
+    on_entry_skipped: Optional[Any] = None
+    # Diagnostic: on_day_processed(date, df_day, entries) — called after find_entries_for_day; use to log what engine receives per day
+    on_day_processed: Optional[Any] = None
 
 
 def _time_to_minutes(t: time) -> int:
@@ -162,10 +180,8 @@ def _build_day_price_cache(
                 chosen_col = cand
                 break
         if chosen_col is None:
-            raise ValueError(
-                f"Missing time column for {t.hour}:{t.minute:02d}. "
-                "Wide data must have ET time columns (e.g. 9:30, 9:31). No fallback."
-            )
+            # Sparse intraday: leave this time slot as NaN; downstream skips unavailable prices
+            continue
         col_values = _to_float_series(day_df[chosen_col]).to_numpy(dtype=float, na_value=np.nan)
         matrix[:, col_pos] = col_values
 
@@ -260,13 +276,17 @@ class ChronologicalBacktestEngine:
                     total_steps += n_days * len(starting_accounts)
         pbar = None
         if show_progress and total_steps > 0:
-            from tqdm.auto import tqdm
-            pbar = tqdm(total=total_steps, desc="Backtest", unit="day")
+            try:
+                from tqdm.auto import tqdm
+            except Exception:
+                tqdm = None
+            if tqdm is not None:
+                pbar = tqdm(total=total_steps, desc="Backtest", unit="day")
 
         # Build enriched long for MFE/MAE/unrealized PL and Entry/Exit columns (when use_library_columns)
         if enriched_long_by_year is None:
             enriched_long_by_year = {}
-        if self.config.use_library_columns and not enriched_long_by_year:
+        if self.config.use_library_columns and has_librarycolumn() and not enriched_long_by_year:
             in_memory = {k: v for k, v in iter_items if isinstance(v, pd.DataFrame)}
             if in_memory:
                 from .librarycolumn_enrichment import enrich_cleaned_year_data
@@ -338,7 +358,6 @@ class ChronologicalBacktestEngine:
         """Run backtest for one account by reading parquet in date-chunks; merge results."""
         path = Path(path)
         path_str = str(path.resolve())
-        # Get unique dates without loading full file (read only Date column)
         dates_df = pd.read_parquet(path_str, columns=["Date"], engine="pyarrow")
         if "Date" not in dates_df.columns:
             raise ValueError(f"Parquet {path_str} has no 'Date' column.")
@@ -370,6 +389,8 @@ class ChronologicalBacktestEngine:
             if df_chunk.empty:
                 continue
             df_chunk["Date"] = pd.to_datetime(df_chunk["Date"], errors="coerce").dt.normalize()
+            if pd.api.types.is_datetime64tz_dtype(df_chunk["Date"]):
+                df_chunk["Date"] = df_chunk["Date"].dt.tz_localize(None)
             df_chunk = df_chunk.dropna(subset=["Date"]).sort_values("Date")
             daily_groups = df_chunk.groupby("Date")
             run = self._run_single_account(
@@ -441,6 +462,10 @@ class ChronologicalBacktestEngine:
                 entries = find_entries(df_day, timeline, get_price) or []
             entries.sort(key=lambda x: (x.entry_time.hour, x.entry_time.minute, x.entry_time.second, str(x.ticker)))
 
+            cb_day = getattr(self.config, "on_day_processed", None)
+            if callable(cb_day):
+                cb_day(date, df_day, entries)
+
             entries_by_time: dict[time, list] = {}
             for e in entries:
                 entries_by_time.setdefault(e.entry_time, []).append(e)
@@ -453,16 +478,29 @@ class ChronologicalBacktestEngine:
                 for entry in entries_by_time.get(current_time, []):
                     row = row_lookup.get(entry.row_index)
                     if row is None:
+                        cb = getattr(self.config, "on_entry_skipped", None)
+                        if callable(cb):
+                            cb(entry, date, "row_missing")
                         continue
                     shares, entry_value = self._size_position(
                         entry.entry_price, row, account_balance,
                         stop_price=entry.stop_price, side=entry.side,
                     )
                     if shares <= 0 or entry_value <= 0:
+                        cb = getattr(self.config, "on_entry_skipped", None)
+                        if callable(cb):
+                            cb(entry, date, "shares_zero")
                         continue
                     required_margin = entry_value * self.config.margin_requirement
                     if available_balance < required_margin:
+                        cb = getattr(self.config, "on_entry_skipped", None)
+                        if callable(cb):
+                            cb(entry, date, "margin_insufficient")
                         continue
+
+                    cb_taken = getattr(self.config, "on_entry_taken", None)
+                    if callable(cb_taken):
+                        cb_taken(entry, date)
 
                     entry_column_snapshot: Optional[dict] = None
                     if self.config.use_library_columns:
