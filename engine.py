@@ -40,15 +40,19 @@ class BacktestConfig:
     session_end: time
     fixed_risk_per_trade: Optional[float] = None  # Fixed $ risk per trade (e.g. 500)
     risk_pct_per_trade: Optional[float] = None   # % of account risk per trade (e.g. 0.05 = 5%); used by RiskSizer
-    margin_requirement: float = 1.0
+    margin_requirement: Union[float, Callable[..., float]] = 1.0  # float = fraction of entry_value; callable(entry_price, shares, side) -> required_margin $
     sizer: Optional[Any] = None  # Pluggable sizer (FixedSizeSizer, PercentOfEquitySizer, RiskSizer, KellySizer). If None, uses RiskSizer(config).
     float_cap_pct: float = 0.05
     equity_cap_pct: float = 0.10
     absolute_cap_value: float = 1_000_000.0
-    commission: float = 3.0
+    # Commission: per order = max(min_per_order, min(per_share * shares, max_pct * order_value)); round-trip = entry order + exit order
+    commission_per_share: float = 0.0035
+    commission_min_per_order: float = 0.35
+    commission_max_pct_per_order: float = 0.01  # 1% of trade value per order (cap)
+    commission: float = 3.0  # Deprecated: unused when commission_per_share is used (default); kept for backward compat
     sec_taf_fee_per_share: float = 0.00013
     slippage_pct: float = 0.005
-    gst_rate: float = 0.10
+    gst_rate: float = 0.0  # GST on commission + SEC/TAF (set to 0 to disable)
     borrow_annual_base: float = 0.30
     borrow_annual_high: float = 0.50
     timeline_step_seconds: int = 60
@@ -61,6 +65,10 @@ class BacktestConfig:
     on_entry_skipped: Optional[Any] = None
     # Diagnostic: on_day_processed(date, df_day, entries) — called after find_entries_for_day; use to log what engine receives per day
     on_day_processed: Optional[Any] = None
+    # If True, print one-time stats for first streamed chunk: chunk rows, n_days, first-day rows, first-day entries (to investigate 3M->few hundred drop)
+    debug_streamed_first_chunk: bool = False
+    # If > 0, log (entry_value, required_margin, available_balance_before) for the first N taken entries (investigate margin / position size)
+    debug_log_first_taken_entries: int = 0
 
 
 def _time_to_minutes(t: time) -> int:
@@ -393,6 +401,17 @@ class ChronologicalBacktestEngine:
                 df_chunk["Date"] = df_chunk["Date"].dt.tz_localize(None)
             df_chunk = df_chunk.dropna(subset=["Date"]).sort_values("Date")
             daily_groups = df_chunk.groupby("Date")
+            if getattr(self.config, "debug_streamed_first_chunk", False) and i == 0:
+                n_chunk_rows = len(df_chunk)
+                n_days = daily_groups.ngroups
+                first_date = next(iter(daily_groups))[0]
+                first_day_df = df_chunk[df_chunk["Date"] == first_date]
+                n_first_day_rows = len(first_day_df)
+                timeline = _iter_times(self.config.session_start, self.config.session_end, self.config.timeline_step_seconds)
+                _row_lookup, _tp, _pm, get_price = _build_day_price_cache(first_day_df, timeline)
+                day_ctx = strategy.prepare_day(first_day_df, timeline, get_price) if getattr(strategy, "prepare_day", None) else None
+                entries_first = strategy.find_entries_for_day(first_day_df, timeline, get_price, day_ctx) or []
+                print(f"[debug_streamed] first chunk: chunk_rows={n_chunk_rows}, n_days={n_days}, first_day={first_date!s}, first_day_rows={n_first_day_rows}, first_day_entries={len(entries_first)}")
             run = self._run_single_account(
                 daily_groups, int(round(balance)), strategy, pbar=None,
                 enriched_long_df=enriched_long_df,
@@ -445,6 +464,8 @@ class ChronologicalBacktestEngine:
         losing_trades = 0
         trades_list: list[dict] = []
         daily_equity: list[float] = [float(starting_account)]
+        _debug_taken_log_n = getattr(self.config, "debug_log_first_taken_entries", 0)
+        _debug_taken_count = 0
 
         for date, df_day in daily_groups:
             timeline = _iter_times(self.config.session_start, self.config.session_end, self.config.timeline_step_seconds)
@@ -491,12 +512,20 @@ class ChronologicalBacktestEngine:
                         if callable(cb):
                             cb(entry, date, "shares_zero")
                         continue
-                    required_margin = entry_value * self.config.margin_requirement
+                    mr = self.config.margin_requirement
+                    if callable(mr):
+                        required_margin = mr(entry.entry_price, shares, entry.side)
+                    else:
+                        required_margin = entry_value * mr
                     if available_balance < required_margin:
                         cb = getattr(self.config, "on_entry_skipped", None)
                         if callable(cb):
                             cb(entry, date, "margin_insufficient")
                         continue
+
+                    if _debug_taken_log_n > 0 and _debug_taken_count < _debug_taken_log_n:
+                        print(f"[debug_taken] #{_debug_taken_count + 1} entry_value={entry_value:.2f} required_margin={required_margin:.2f} available_balance_before={available_balance:.2f} date={date!s} ticker={entry.ticker}")
+                        _debug_taken_count += 1
 
                     cb_taken = getattr(self.config, "on_entry_taken", None)
                     if callable(cb_taken):
@@ -607,11 +636,20 @@ class ChronologicalBacktestEngine:
                     else:
                         signal = check_exit(pos, row, current_time, get_price)
 
-                    # Engine-level time exit safeguard.
+                    # Engine-level time exit safeguard (so positions close EOD and margin is freed).
                     if signal is None and current_time == self.config.session_end:
                         forced = _to_float(row.get(self.config.exit_price_col))
                         if forced is None:
                             forced = get_price(row, current_time)
+                        if forced is None:
+                            # Fallback: last available bar price on or before session_end so we always
+                            # close at EOD and return margin (otherwise positions stay open → ~1 trade/day).
+                            for t in reversed(timeline):
+                                if t <= current_time:
+                                    p = get_price(row, t)
+                                    if p is not None and p > 0:
+                                        forced = p
+                                        break
                         if forced is not None and forced > 0:
                             from .bt_types import ExitSignal
 
@@ -647,7 +685,12 @@ class ChronologicalBacktestEngine:
                         losing_trades += 1
 
                     account_balance += net_pnl
-                    available_balance += pos.shares * pos.entry_price * self.config.margin_requirement + net_pnl
+                    mr = self.config.margin_requirement
+                    if callable(mr):
+                        margin_returned = mr(pos.entry_price, pos.shares, pos.side)
+                    else:
+                        margin_returned = pos.shares * pos.entry_price * mr
+                    available_balance += margin_returned + net_pnl
                     available_balance = max(0.0, available_balance)
                     trade.account_balance_after = account_balance
                     tdict = asdict(trade)
@@ -759,8 +802,13 @@ class ChronologicalBacktestEngine:
         else:
             borrow_cost = 0.0
         sec_taf_fee = pos.shares * self.config.sec_taf_fee_per_share
-        commission_total = self.config.commission
-        gst = (commission_total + sec_taf_fee) * self.config.gst_rate
+        # Commission per order: 0.0035/share, USD 0.35 minimum, max 1% of order value; round-trip = entry + exit
+        def _commission_per_order(shares: int, order_value: float) -> float:
+            raw = shares * self.config.commission_per_share
+            capped = min(raw, order_value * self.config.commission_max_pct_per_order) if order_value > 0 else raw
+            return max(self.config.commission_min_per_order, capped)
+        commission_total = _commission_per_order(pos.shares, entry_value) + _commission_per_order(pos.shares, exit_value)
+        gst = (commission_total + sec_taf_fee) * self.config.gst_rate  # 0 when gst_rate=0
         total_costs = commission_total + sec_taf_fee + slippage_total + gst + borrow_cost
 
         if pos.side.lower() == "long":
