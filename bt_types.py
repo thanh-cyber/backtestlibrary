@@ -30,7 +30,7 @@ class Position:
     ticker: str
     row_index: Any
     side: str
-    shares: int
+    shares: float
     entry_price: float
     entry_time: time
     stop_price: Optional[float]
@@ -78,7 +78,7 @@ class TradeRecord:
     exit_time: str
     exit_price: float
     exit_reason: str
-    shares: int
+    shares: float
     hold_minutes: int
     gross_pnl: float
     commission: float
@@ -151,6 +151,8 @@ class SizerConfig(Protocol):
     float_cap_pct: float
     equity_cap_pct: float
     absolute_cap_value: float
+    allow_fractional_shares: bool
+    qty_step: float
 
 
 class Sizer(Protocol):
@@ -164,8 +166,8 @@ class Sizer(Protocol):
         stop_price: Optional[float],
         side: str,
         config: SizerConfig,
-    ) -> tuple[int, float]:
-        """Return (shares, entry_value). Engine will apply float/equity/absolute caps."""
+    ) -> tuple[float, float]:
+        """Return (quantity, entry_value). Engine applies float/equity/absolute caps."""
         ...
 
 

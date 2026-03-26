@@ -32,8 +32,17 @@ def _sharpe(returns: pd.Series, risk_free: float = 0.0, periods_per_year: int = 
     if len(returns) < 2:
         return np.nan
     excess = returns - risk_free
-    std = excess.std()
-    return float(excess.mean() / std * np.sqrt(periods_per_year)) if std != 0 else np.nan
+    try:
+        std = float(excess.std())
+        if std == 0 or pd.isna(std):
+            return np.nan
+        mu = float(excess.mean())
+        val = (mu / std) * float(np.sqrt(periods_per_year))
+    except (OverflowError, ZeroDivisionError, FloatingPointError, ValueError):
+        return np.nan
+    if np.isinf(val) or np.isnan(val):
+        return np.nan
+    return float(val)
 
 
 def _sortino(returns: pd.Series, risk_free: float = 0.0, periods_per_year: int = 252) -> float:
@@ -42,8 +51,17 @@ def _sortino(returns: pd.Series, risk_free: float = 0.0, periods_per_year: int =
     downside = returns[returns < 0]
     if len(downside) < 2:
         return np.nan
-    dstd = downside.std()
-    return float((returns.mean() - risk_free) / dstd * np.sqrt(periods_per_year)) if dstd != 0 else np.nan
+    try:
+        dstd = float(downside.std())
+        if dstd == 0 or pd.isna(dstd):
+            return np.nan
+        mu = float(returns.mean() - risk_free)
+        val = (mu / dstd) * float(np.sqrt(periods_per_year))
+    except (OverflowError, ZeroDivisionError, FloatingPointError, ValueError):
+        return np.nan
+    if np.isinf(val) or np.isnan(val):
+        return np.nan
+    return float(val)
 
 
 def _ulcer_index(equity_curve: np.ndarray) -> float:
@@ -95,7 +113,10 @@ class FullMetricsAnalyzer(Analyzer):
         avg_loss = float(gross_pnl[gross_pnl < 0].mean()) if (gross_pnl < 0).any() else 0.0
         pf = _profit_factor(gross_pnl)
         expectancy = _expectancy(net_pnl)
-        payoff_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else np.inf
+        try:
+            payoff_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else np.inf
+        except (OverflowError, FloatingPointError, ZeroDivisionError):
+            payoff_ratio = np.nan
 
         stop_ct = int((t["exit_reason"] == "Stop Loss").sum()) if "exit_reason" in t.columns else 0
         take_ct = int((t["exit_reason"] == "Take Profit").sum()) if "exit_reason" in t.columns else 0
@@ -106,11 +127,17 @@ class FullMetricsAnalyzer(Analyzer):
 
         num_periods = len(daily_ret)
         years_equiv = max(num_periods / 252.0, 1e-9)
-        cagr = (
-            ((final_bal / start_bal) ** (1 / years_equiv) - 1) * 100.0
-            if start_bal > 0 and num_periods >= 1
-            else total_return
-        )
+        # For single-period backtests (very common in your "one day" recon),
+        # CAGR can become numerically unstable (huge exponent); fall back to total_return.
+        cagr = total_return
+        if start_bal > 0 and num_periods >= 2:
+            try:
+                ratio = float(final_bal) / float(start_bal)
+                if ratio > 0:
+                    cagr = ((ratio ** (1 / years_equiv)) - 1) * 100.0
+            except (OverflowError, FloatingPointError, ZeroDivisionError):
+                cagr = total_return
+
         sharpe = _sharpe(daily_ret)
         sortino = _sortino(daily_ret)
         calmar = (cagr / 100.0) / abs(max_dd / 100.0) if max_dd != 0 else np.nan

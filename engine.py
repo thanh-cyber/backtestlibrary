@@ -45,9 +45,15 @@ class BacktestConfig:
     float_cap_pct: float = 0.05
     equity_cap_pct: float = 0.10
     absolute_cap_value: float = 1_000_000.0
-    # Commission: per order = max(min_per_order, min(per_share * shares, max_pct * order_value)); round-trip = entry order + exit order
-    commission_per_share: float = 0.0035
-    commission_min_per_order: float = 0.35
+    # Quantity handling:
+    # - allow_fractional_shares=False keeps legacy stock behavior (integer shares only).
+    # - allow_fractional_shares=True allows fractional quantities (useful for crypto).
+    # - qty_step is the minimum increment (e.g. 0.001 BTC); quantities are floored to this step.
+    allow_fractional_shares: bool = False
+    qty_step: float = 1.0
+    # IBKR US stock Fixed: USD 0.005/share, min USD 1.00/order, max 1% of order value/order (round-trip = entry + exit).
+    commission_per_share: float = 0.005
+    commission_min_per_order: float = 1.0
     commission_max_pct_per_order: float = 0.01  # 1% of trade value per order (cap)
     commission: float = 3.0  # Deprecated: unused when commission_per_share is used (default); kept for backward compat
     sec_taf_fee_per_share: float = 0.00013
@@ -60,15 +66,43 @@ class BacktestConfig:
     exit_price_col: str = "Exit_Price"
     use_library_columns: bool = True  # When True, engine runs entry/exit columns from librarycolumn at entry/exit time; default on so columns are always included
     defer_column_phase: bool = False  # When True, engine skips enrichment; run enrich_results(raw_results, ...) in a separate cell
-    # Diagnostic callbacks: on_entry_taken(entry, date), on_entry_skipped(entry, date, reason). reason: "row_missing"|"shares_zero"|"margin_insufficient"
+    # Diagnostic callbacks: on_entry_taken(entry, date), on_entry_skipped(entry, date, reason). reason: "row_missing"|"shares_zero"|"margin_insufficient"|"max_open_per_ticker"
     on_entry_taken: Optional[Any] = None
     on_entry_skipped: Optional[Any] = None
     # Diagnostic: on_day_processed(date, df_day, entries) — called after find_entries_for_day; use to log what engine receives per day
     on_day_processed: Optional[Any] = None
+    # If set (e.g. 1), skip opening a new position when that many positions for the same ticker are already open.
+    # None = no limit (legacy behavior). Use 1 for "multiple entries per day but only one open trade per symbol at a time".
+    max_open_trades_per_ticker: Optional[int] = None
     # If True, print one-time stats for first streamed chunk: chunk rows, n_days, first-day rows, first-day entries (to investigate 3M->few hundred drop)
     debug_streamed_first_chunk: bool = False
     # If > 0, log (entry_value, required_margin, available_balance_before) for the first N taken entries (investigate margin / position size)
     debug_log_first_taken_entries: int = 0
+
+
+def commission_per_order_us_stock_fixed(
+    shares: float,
+    order_value: float,
+    *,
+    commission_per_share: float,
+    commission_min_per_order: float,
+    commission_max_pct_per_order: float,
+) -> float:
+    """Commission for one US stock order (buy or sell).
+
+    Implements the **IBKR US stock Fixed** *commission* line (not SEC/FINRA/clearing
+    pass-throughs, which are modeled separately via ``sec_taf_fee`` / future fields)::
+
+        fee = max(min_per_order, min(per_share * shares, max_pct * order_value))
+
+    Round-trip commission in the engine is **two** orders (entry + exit), so this
+    function is called twice per closed trade with the appropriate notionals.
+    """
+    sh = abs(float(shares))
+    val = float(order_value)
+    raw = sh * commission_per_share
+    capped = min(raw, val * commission_max_pct_per_order) if val > 0 else raw
+    return max(commission_min_per_order, capped)
 
 
 def _time_to_minutes(t: time) -> int:
@@ -399,7 +433,11 @@ class ChronologicalBacktestEngine:
             df_chunk["Date"] = pd.to_datetime(df_chunk["Date"], errors="coerce").dt.normalize()
             if pd.api.types.is_datetime64tz_dtype(df_chunk["Date"]):
                 df_chunk["Date"] = df_chunk["Date"].dt.tz_localize(None)
-            df_chunk = df_chunk.dropna(subset=["Date"]).sort_values("Date")
+            df_chunk = df_chunk.dropna(subset=["Date"])
+            # Wide minute parquets are often written sorted by Date. sort_values duplicates the frame
+            # (~rows × cols × 8 bytes) and can OOM; skip when order is already valid for groupby.
+            if not df_chunk["Date"].is_monotonic_increasing:
+                df_chunk = df_chunk.sort_values("Date")
             daily_groups = df_chunk.groupby("Date")
             if getattr(self.config, "debug_streamed_first_chunk", False) and i == 0:
                 n_chunk_rows = len(df_chunk)
@@ -503,6 +541,17 @@ class ChronologicalBacktestEngine:
                         if callable(cb):
                             cb(entry, date, "row_missing")
                         continue
+                    mot = getattr(self.config, "max_open_trades_per_ticker", None)
+                    if mot is not None:
+                        sym = str(entry.ticker).strip().upper()
+                        n_same = sum(
+                            1 for p in open_positions if str(p.ticker).strip().upper() == sym
+                        )
+                        if n_same >= mot:
+                            cb = getattr(self.config, "on_entry_skipped", None)
+                            if callable(cb):
+                                cb(entry, date, "max_open_per_ticker")
+                            continue
                     shares, entry_value = self._size_position(
                         entry.entry_price, row, account_balance,
                         stop_price=entry.stop_price, side=entry.side,
@@ -669,12 +718,25 @@ class ChronologicalBacktestEngine:
                             v = _to_float(row_exit_enriched.get(col))
                             if v is not None:
                                 pos._continuous_exit[col] = v
+                    # Enforce verbatim TP/SL fill prices:
+                    # Even if a strategy's ExitSignal accidentally uses an OHLC price (e.g. open_bar),
+                    # we treat Stop Loss / Take Profit as filled strictly at pos.stop_price / pos.target_price.
+                    _exit_price = float(signal.exit_price)
+                    try:
+                        if signal.reason == "Stop Loss" and getattr(pos, "stop_price", None) is not None:
+                            _exit_price = float(pos.stop_price)
+                        elif signal.reason == "Take Profit" and getattr(pos, "target_price", None) is not None:
+                            _exit_price = float(pos.target_price)
+                    except Exception:
+                        # If something unexpected happens, fall back to the provided signal price.
+                        _exit_price = float(signal.exit_price)
+
                     net_pnl, trade = self._close_trade(
                         pos=pos,
                         row=row,
                         date=date,
                         exit_time=current_time,
-                        exit_price=float(signal.exit_price),
+                        exit_price=_exit_price,
                         exit_reason=signal.reason,
                         row_enriched=row_exit_enriched,
                     )
@@ -752,7 +814,7 @@ class ChronologicalBacktestEngine:
         account_balance: float,
         stop_price: Optional[float] = None,
         side: str = "long",
-    ) -> tuple[int, float]:
+    ) -> tuple[float, float]:
         """Use configured sizer to get raw size, then apply float/equity/absolute caps."""
         if entry_price is None or not np.isfinite(entry_price) or entry_price <= 0:
             return 0, 0.0
@@ -774,8 +836,17 @@ class ChronologicalBacktestEngine:
 
         if caps:
             shares = min(shares, *caps)
-        shares = int(max(0, shares))
-        return shares, float(shares * entry_price)
+        qty = max(0.0, float(shares))
+        if self.config.allow_fractional_shares:
+            step = float(getattr(self.config, "qty_step", 1.0) or 1.0)
+            if not np.isfinite(step) or step <= 0:
+                step = 1.0
+            qty = np.floor(qty / step) * step
+            if qty < step:
+                qty = 0.0
+        else:
+            qty = float(int(qty))
+        return qty, float(qty * entry_price)
 
     def _close_trade(
         self,
@@ -802,12 +873,19 @@ class ChronologicalBacktestEngine:
         else:
             borrow_cost = 0.0
         sec_taf_fee = pos.shares * self.config.sec_taf_fee_per_share
-        # Commission per order: 0.0035/share, USD 0.35 minimum, max 1% of order value; round-trip = entry + exit
-        def _commission_per_order(shares: int, order_value: float) -> float:
-            raw = shares * self.config.commission_per_share
-            capped = min(raw, order_value * self.config.commission_max_pct_per_order) if order_value > 0 else raw
-            return max(self.config.commission_min_per_order, capped)
-        commission_total = _commission_per_order(pos.shares, entry_value) + _commission_per_order(pos.shares, exit_value)
+        commission_total = commission_per_order_us_stock_fixed(
+            pos.shares,
+            entry_value,
+            commission_per_share=self.config.commission_per_share,
+            commission_min_per_order=self.config.commission_min_per_order,
+            commission_max_pct_per_order=self.config.commission_max_pct_per_order,
+        ) + commission_per_order_us_stock_fixed(
+            pos.shares,
+            exit_value,
+            commission_per_share=self.config.commission_per_share,
+            commission_min_per_order=self.config.commission_min_per_order,
+            commission_max_pct_per_order=self.config.commission_max_pct_per_order,
+        )
         gst = (commission_total + sec_taf_fee) * self.config.gst_rate  # 0 when gst_rate=0
         total_costs = commission_total + sec_taf_fee + slippage_total + gst + borrow_cost
 

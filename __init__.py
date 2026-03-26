@@ -5,7 +5,11 @@ implemented separately and plugged into the engine via the Strategy protocol.
 """
 
 from .data import GapperDataLoader, LoaderConfig, ParquetDataLoader, ParquetLoaderConfig
-from .engine import ChronologicalBacktestEngine, BacktestConfig
+from .engine import (
+    BacktestConfig,
+    ChronologicalBacktestEngine,
+    commission_per_order_us_stock_fixed,
+)
 from .analyzers import build_full_metrics
 from .monte_carlo import run_monte_carlo
 from .exit_metrics import (
@@ -63,6 +67,7 @@ from .column_definitions import (
 __all__ = [
     "Analyzer",
     "BacktestConfig",
+    "commission_per_order_us_stock_fixed",
     "FixedSizeSizer",
     "KellySizer",
     "PercentOfEquitySizer",

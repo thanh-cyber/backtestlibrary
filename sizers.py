@@ -23,6 +23,19 @@ def _to_float(value) -> Optional[float]:
     return x if abs(x) != float("inf") and x == x else None
 
 
+def _apply_qty_mode(raw_qty: float, config: SizerConfig) -> float:
+    """Apply integer/fractional quantity mode from config."""
+    qty = max(0.0, float(raw_qty))
+    allow_fractional = bool(getattr(config, "allow_fractional_shares", False))
+    if not allow_fractional:
+        return float(int(qty))
+    step = float(getattr(config, "qty_step", 1.0) or 1.0)
+    if step <= 0:
+        step = 1.0
+    qty = (qty // step) * step
+    return qty if qty >= step else 0.0
+
+
 class FixedSizeSizer:
     """Fixed number of shares per trade. Does not require stop_price."""
 
@@ -39,11 +52,11 @@ class FixedSizeSizer:
         stop_price: Optional[float],
         side: str,
         config: SizerConfig,
-    ) -> tuple[int, float]:
+    ) -> tuple[float, float]:
         if entry_price is None or entry_price <= 0:
             return 0, 0.0
-        shares = self.stake
-        return shares, float(shares * entry_price)
+        qty = _apply_qty_mode(self.stake, config)
+        return qty, float(qty * entry_price)
 
 
 class PercentOfEquitySizer:
@@ -60,14 +73,14 @@ class PercentOfEquitySizer:
         stop_price: Optional[float],
         side: str,
         config: SizerConfig,
-    ) -> tuple[int, float]:
+    ) -> tuple[float, float]:
         if entry_price is None or entry_price <= 0 or account_balance <= 0 or self.percent <= 0:
             return 0, 0.0
         notional = account_balance * self.percent
-        shares = int(notional / entry_price)
-        if shares <= 0:
+        qty = _apply_qty_mode(notional / entry_price, config)
+        if qty <= 0:
             return 0, 0.0
-        return shares, float(shares * entry_price)
+        return qty, float(qty * entry_price)
 
 
 class RiskSizer:
@@ -81,7 +94,7 @@ class RiskSizer:
         stop_price: Optional[float],
         side: str,
         config: SizerConfig,
-    ) -> tuple[int, float]:
+    ) -> tuple[float, float]:
         if stop_price is None or entry_price <= 0:
             return 0, 0.0
         risk_per_share = abs(entry_price - stop_price)
@@ -94,10 +107,10 @@ class RiskSizer:
             risk_dollars = config.fixed_risk_per_trade
         if risk_dollars is None or risk_dollars <= 0:
             return 0, 0.0
-        shares = int(risk_dollars / risk_per_share)
-        if shares <= 0:
+        qty = _apply_qty_mode(risk_dollars / risk_per_share, config)
+        if qty <= 0:
             return 0, 0.0
-        return shares, float(shares * entry_price)
+        return qty, float(qty * entry_price)
 
 
 class KellySizer:
@@ -123,7 +136,7 @@ class KellySizer:
         stop_price: Optional[float],
         side: str,
         config: SizerConfig,
-    ) -> tuple[int, float]:
+    ) -> tuple[float, float]:
         if stop_price is None or entry_price <= 0:
             return 0, 0.0
         risk_per_share = abs(entry_price - stop_price)
@@ -143,7 +156,7 @@ class KellySizer:
         if account_balance <= 0 or risk_pct <= 0:
             return 0, 0.0
         risk_dollars = account_balance * risk_pct
-        shares = int(risk_dollars / risk_per_share)
-        if shares <= 0:
+        qty = _apply_qty_mode(risk_dollars / risk_per_share, config)
+        if qty <= 0:
             return 0, 0.0
-        return shares, float(shares * entry_price)
+        return qty, float(qty * entry_price)

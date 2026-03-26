@@ -6,7 +6,11 @@ from datetime import time
 import pandas as pd
 
 from backtestlibrary.bt_types import EntryCandidate
-from backtestlibrary.engine import BacktestConfig, ChronologicalBacktestEngine
+from backtestlibrary.engine import (
+    BacktestConfig,
+    ChronologicalBacktestEngine,
+    commission_per_order_us_stock_fixed,
+)
 from backtestlibrary.sizers import FixedSizeSizer, KellySizer, PercentOfEquitySizer, RiskSizer
 
 
@@ -284,3 +288,88 @@ class TestEngineIntegration:
         # Exit columns from librarycolumn (or defaults) should be present on the trade row
         first = r.trades.iloc[0]
         assert "Exit_Col_ATR14" in first.index or "Exit_Col_VWAP" in first.index
+
+
+class TestIBKRFixedCommission:
+    """IBKR US stock Fixed commission component (per order); see BacktestConfig defaults."""
+
+    _PS = 0.005
+    _MN = 1.0
+    _CAP = 0.01
+
+    def test_minimum_per_order_when_raw_below_one_dollar(self):
+        # 100 sh * 0.005 = 0.50 < 1.00 min
+        assert (
+            commission_per_order_us_stock_fixed(
+                100,
+                1_000.0,
+                commission_per_share=self._PS,
+                commission_min_per_order=self._MN,
+                commission_max_pct_per_order=self._CAP,
+            )
+            == 1.0
+        )
+
+    def test_per_share_when_above_minimum_under_cap(self):
+        # 500 * 0.005 = 2.5
+        assert (
+            commission_per_order_us_stock_fixed(
+                500,
+                10_000.0,
+                commission_per_share=self._PS,
+                commission_min_per_order=self._MN,
+                commission_max_pct_per_order=self._CAP,
+            )
+            == 2.5
+        )
+
+    def test_one_percent_cap_binds(self):
+        # raw = 2000 * 0.005 = 10; cap = 1% * 10_000 = 100 -> 10; max(1, 10) = 10
+        assert (
+            commission_per_order_us_stock_fixed(
+                2000,
+                10_000.0,
+                commission_per_share=self._PS,
+                commission_min_per_order=self._MN,
+                commission_max_pct_per_order=self._CAP,
+            )
+            == 10.0
+        )
+
+    def test_cap_binds_below_raw(self):
+        # raw = 5000 * 0.005 = 25; cap = 1% * 1000 = 10 -> fee 10
+        assert (
+            commission_per_order_us_stock_fixed(
+                5000,
+                1_000.0,
+                commission_per_share=self._PS,
+                commission_min_per_order=self._MN,
+                commission_max_pct_per_order=self._CAP,
+            )
+            == 10.0
+        )
+
+    def test_round_trip_is_sum_of_two_orders(self):
+        entry_fee = commission_per_order_us_stock_fixed(
+            100,
+            1_000.0,
+            commission_per_share=self._PS,
+            commission_min_per_order=self._MN,
+            commission_max_pct_per_order=self._CAP,
+        )
+        exit_fee = commission_per_order_us_stock_fixed(
+            100,
+            950.0,
+            commission_per_share=self._PS,
+            commission_min_per_order=self._MN,
+            commission_max_pct_per_order=self._CAP,
+        )
+        assert entry_fee == 1.0
+        assert exit_fee == 1.0
+        assert entry_fee + exit_fee == 2.0
+
+    def test_backtest_config_default_commission_matches_ib_fixed(self):
+        cfg = BacktestConfig(session_start=time(9, 30), session_end=time(16, 0), risk_pct_per_trade=0.05)
+        assert cfg.commission_per_share == 0.005
+        assert cfg.commission_min_per_order == 1.0
+        assert cfg.commission_max_pct_per_order == 0.01
