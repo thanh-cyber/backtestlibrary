@@ -15,7 +15,7 @@ pip install -e .
 **Optional extras:**
 
 ```bash
-pip install -e ".[librarycolumn]"   # entry/exit/continuous column snapshots (requires librarycolumn)
+pip install -e ".[librarycolumn]"   # entry/exit snapshots + Phase 2 continuous (requires librarycolumn)
 pip install -e ".[plot]"            # matplotlib plotting (plot_result, plot_equity_drawdown, plot_trade_pnl)
 pip install -e ".[librarycolumn,plot]"   # both
 ```

@@ -91,9 +91,6 @@ ENTRY_COLUMNS: List[str] = [
     "Col_UnrealizedPL_Noon",
     "Col_UnrealizedPL_2pm",
     "Col_UnrealizedPL_30minBeforeClose",
-    "Col_MaxFavorableExcursion_R",
-    "Col_BarsSinceEntry",
-    "Col_PosSize_PctAccount",
     # Time
     "Col_EntryTime_HourNumeric",
     "Col_DayOfWeek",
@@ -180,9 +177,6 @@ EXIT_SNAPSHOT_COLUMNS: List[str] = [
     "Col_UnrealizedPL_Noon",
     "Col_UnrealizedPL_2pm",
     "Col_UnrealizedPL_30minBeforeClose",
-    "Col_MaxFavorableExcursion_R",
-    "Col_BarsSinceEntry",
-    "Col_PosSize_PctAccount",
     # Time
     "Col_EntryTime_HourNumeric",
     "Col_DayOfWeek",

@@ -36,7 +36,7 @@ This update hardens the library for environments where optional dependencies are
 
 - **Enrichment bootstrap**  
   - **Before:** When `use_library_columns` was True and `enriched_long_by_year` was not provided, the engine called `enrich_cleaned_year_data(in_memory)` whenever in-memory data existed, which could fail in minimal environments without `librarycolumn`.  
-  - **After:** Enrichment is only attempted when `has_librarycolumn()` is True. If librarycolumn is not installed, the engine skips building enriched long data and continues without entry/exit/continuous column enrichment.
+  - **After:** Enrichment is only attempted when `has_librarycolumn()` is True. If librarycolumn is not installed, the engine skips building enriched long data (weaker in-loop entry/exit row snapshots). Full **Continuous_*** and rich Phase 2 columns still require librarycolumn via `enrich_results` / `enrich_trades_post_backtest`.
 
 - **`_build_day_price_cache(day_df, timeline)`**  
   - **Before:** For each time in `timeline`, if no matching wide column (e.g. `9:30`, `9:31`) was found in `day_df`, the function raised `ValueError` and aborted the run.  

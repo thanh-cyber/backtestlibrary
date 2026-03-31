@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import os
 import re
+from functools import lru_cache
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import time
 from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
+from .columns import _lib as _column_lib
 
 
 # Time column pattern: "9:30", "09:30", "16:00"
@@ -48,12 +51,139 @@ def _extract_volume_time_map(columns: list) -> dict[str, str]:
     return vol_map
 
 
+def _extract_prefixed_time_map(columns: list, prefix: str) -> dict[str, str]:
+    """Map normalized time 'H:MM' -> column name for a prefixed minute field (e.g. Open/High/Low)."""
+    out: dict[str, str] = {}
+    pref = f"{prefix} "
+    for c in columns:
+        s = str(c).strip()
+        if not s.lower().startswith(pref.lower()):
+            continue
+        t = s[len(pref) :].strip()
+        if _TIME_COL_RE.match(t):
+            out[_normalize_time_str(t)] = c
+    return out
+
+
 def _normalize_time_str(t_str: str) -> str:
     """Normalize '9:30' or '09:30' -> '9:30' for merge keys."""
     parts = t_str.split(":")
     h = int(parts[0])
     mm = int(parts[1]) if len(parts) > 1 else 0
     return f"{h}:{mm:02d}"
+
+
+@lru_cache(maxsize=1024)
+def _yf_daily(symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+    try:
+        import yfinance as yf
+    except Exception:
+        return None
+    def _shape_hist(hist: pd.DataFrame) -> Optional[pd.DataFrame]:
+        if hist is None or hist.empty:
+            return None
+        out = pd.DataFrame(index=pd.to_datetime(hist.index).tz_localize(None).normalize())
+        for c in ("Open", "Close"):
+            s = None
+            if isinstance(hist.columns, pd.MultiIndex):
+                lvl0 = hist.columns.get_level_values(0)
+                if c in lvl0:
+                    sub = hist[c]
+                    s = sub.iloc[:, 0] if isinstance(sub, pd.DataFrame) else sub
+            elif c in hist.columns:
+                s = hist[c]
+            if s is not None:
+                out[c] = pd.to_numeric(pd.Series(s), errors="coerce").to_numpy()
+        if not out.columns.tolist():
+            return None
+        return out
+
+    try:
+        hist = yf.download(
+            tickers=symbol,
+            start=start_date,
+            end=end_date,
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            group_by="column",
+            threads=False,
+        )
+        shaped = _shape_hist(hist)
+        if shaped is not None:
+            return shaped
+    except Exception:
+        pass
+
+    # Fallback path for symbols where yf.download intermittently returns empty.
+    try:
+        tk = yf.Ticker(str(symbol))
+        hist2 = tk.history(start=start_date, end=end_date, interval="1d", auto_adjust=False, actions=False)
+        return _shape_hist(hist2)
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=512)
+def _yf_info(ticker: str) -> dict:
+    try:
+        import yfinance as yf
+    except Exception:
+        return {}
+    try:
+        tk = yf.Ticker(str(ticker))
+        info = getattr(tk, "info", None) or {}
+        fast = getattr(tk, "fast_info", None) or {}
+        out = {}
+        if isinstance(info, dict):
+            out.update(info)
+        if isinstance(fast, dict):
+            out.update(fast)
+        return out
+    except Exception:
+        return {}
+
+
+def _sector_to_etf(sector: Optional[str]) -> Optional[str]:
+    if not sector:
+        return None
+    s = str(sector).strip().lower()
+    m = {
+        "technology": "XLK",
+        "financial services": "XLF",
+        "financial": "XLF",
+        "healthcare": "XLV",
+        "consumer cyclical": "XLY",
+        "consumer defensive": "XLP",
+        "industrials": "XLI",
+        "energy": "XLE",
+        "utilities": "XLU",
+        "real estate": "XLRE",
+        "basic materials": "XLB",
+        "communication services": "XLC",
+    }
+    return m.get(s)
+
+
+def _attach_yfinance_context(long_df: pd.DataFrame) -> pd.DataFrame:
+    """Attach external benchmark/fundamental series used by column_library market-context columns."""
+    if long_df.empty or "Ticker" not in long_df.columns or "datetime" not in long_df.columns:
+        return long_df
+    out = long_df.copy()
+    # yfinance context is intentionally disabled to isolate Phase 2 runtime bottlenecks.
+    for col in ("SPY_Close", "SPX_Close", "Col_QQQPremarketChange_Pct"):
+        if col not in out.columns:
+            out[col] = np.nan
+
+    # Ensure columns exist even when fundamentals enrichment is disabled.
+    for col in ("Sector_Close", "Col_MarketCap", "Col_FloatShares", "Col_ShortInterestPctFloat"):
+        if col not in out.columns:
+            out[col] = np.nan
+
+    # NOTE: Per-ticker yfinance fundamentals are intentionally disabled for now.
+    # Large universes trigger heavy rate-limit pressure and can stall Phase 2.
+    # Market/fundamental fallback is handled downstream in trade_enrichment.
+    return out
 
 
 def wide_to_long(
@@ -82,7 +212,11 @@ def wide_to_long(
     if not time_cols:
         return pd.DataFrame()
 
-    vol_map = _extract_volume_time_map(wide_df.columns.tolist())
+    cols_all = wide_df.columns.tolist()
+    vol_map = _extract_volume_time_map(cols_all)
+    open_map = _extract_prefixed_time_map(cols_all, "Open")
+    high_map = _extract_prefixed_time_map(cols_all, "High")
+    low_map = _extract_prefixed_time_map(cols_all, "Low")
     value_vars = [c for c in time_cols if c in wide_df.columns]
     if not value_vars:
         return pd.DataFrame()
@@ -106,6 +240,12 @@ def wide_to_long(
             columns=["Ticker", date_col, "datetime", "open", "high", "low", "close", "volume"]
         )
 
+    # Build normalized time key on price melt once.
+    t_parts = price_melt["time_str"].astype(str).str.split(":", expand=True)
+    t_h = pd.to_numeric(t_parts[0], errors="coerce").fillna(0).astype("int64")
+    t_mm = pd.to_numeric(t_parts[1], errors="coerce").fillna(0).astype("int64")
+    price_melt["time_key"] = t_h.astype(str) + ":" + t_mm.astype(str).str.zfill(2)
+
     # Merge volume (vectorized) if we have vol columns
     vol_cols = [c for c in vol_map.values() if c in work.columns]
     if vol_cols:
@@ -118,16 +258,11 @@ def wide_to_long(
         )
         vol_melt["time_key"] = vol_melt["vol_col"].map(vol_reverse)
         vol_melt = vol_melt.drop(columns=["vol_col"])
-        t_parts = price_melt["time_str"].astype(str).str.split(":", expand=True)
-        t_h = pd.to_numeric(t_parts[0], errors="coerce").fillna(0).astype("int64")
-        t_mm = pd.to_numeric(t_parts[1], errors="coerce").fillna(0).astype("int64")
-        price_melt["time_key"] = t_h.astype(str) + ":" + t_mm.astype(str).str.zfill(2)
         merged = price_melt.merge(
             vol_melt,
             on=[tc, date_col, "time_key"],
             how="left",
         )
-        merged = merged.drop(columns=["time_key"])
     else:
         merged = price_melt.copy()
         merged["volume"] = 1.0
@@ -135,14 +270,35 @@ def wide_to_long(
     merged["volume"] = pd.to_numeric(merged["volume"], errors="coerce").fillna(1.0)
     merged.loc[merged["volume"] < 0, "volume"] = 1.0
 
+    # Merge Open/High/Low minute columns when present; fallback to close.
+    def _merge_prefixed(base: pd.DataFrame, pmap: dict[str, str], out_name: str) -> pd.DataFrame:
+        pcols = [c for c in pmap.values() if c in work.columns]
+        if not pcols:
+            base[out_name] = base["close"]
+            return base
+        rev = {v: _normalize_time_str(k) for k, v in pmap.items()}
+        pm = work.melt(
+            id_vars=[tc, date_col],
+            value_vars=pcols,
+            var_name=f"{out_name}_col",
+            value_name=out_name,
+        )
+        pm["time_key"] = pm[f"{out_name}_col"].map(rev)
+        pm = pm.drop(columns=[f"{out_name}_col"])
+        out = base.merge(pm, on=[tc, date_col, "time_key"], how="left")
+        out[out_name] = pd.to_numeric(out[out_name], errors="coerce")
+        out[out_name] = out[out_name].where(out[out_name].notna(), out["close"])
+        return out
+
+    merged = _merge_prefixed(merged, open_map, "open")
+    merged = _merge_prefixed(merged, high_map, "high")
+    merged = _merge_prefixed(merged, low_map, "low")
+
     # Parse time_str -> datetime (vectorized)
     parts = merged["time_str"].astype(str).str.split(":", expand=True)
     h = pd.to_numeric(parts[0], errors="coerce").fillna(0).astype("int64")
     mm = pd.to_numeric(parts[1], errors="coerce").fillna(0).astype("int64")
     merged["datetime"] = merged[date_col] + pd.to_timedelta(h * 60 + mm, unit="m")
-    merged["open"] = merged["close"]
-    merged["high"] = merged["close"]
-    merged["low"] = merged["close"]
 
     # Output uses "Ticker" (normalized to upper) for engine compatibility
     merged["Ticker"] = merged[tc].astype(str).str.upper()
@@ -162,10 +318,10 @@ def enrich_long_with_library_columns(long_df: pd.DataFrame) -> pd.DataFrame:
     """
     if long_df.empty:
         return long_df
-    try:
-        import column_library as lib
-    except ImportError as e:
-        raise ImportError("enrich_long_with_library_columns requires column_library (librarycolumn). Install with: pip install librarycolumn") from e
+    lib = _column_lib()
+    if lib is None:
+        raise ImportError("enrich_long_with_library_columns requires vendored backtestlibrary.column_library")
+    long_df = _attach_yfinance_context(long_df)
 
     if hasattr(lib, "add_full_enrichment"):
         return lib.add_full_enrichment(long_df)
@@ -247,6 +403,31 @@ def enrich_cleaned_year_data(
     return out
 
 
+def _nearest_bar_row_same_day(
+    day_df: pd.DataFrame,
+    t: time,
+    *,
+    datetime_col: str = "datetime",
+    max_minute_delta: int = 5,
+) -> Optional[pd.Series]:
+    """
+    Prefer exact (hour, minute) bar; else closest bar by clock-minute distance on the same day.
+    Prevents all-NaN snapshots when trades align to a minute that has no bar (sparse tape / alignment).
+    """
+    if day_df.empty or datetime_col not in day_df.columns:
+        return None
+    dt = pd.to_datetime(day_df[datetime_col])
+    target_min = t.hour * 60 + t.minute
+    bar_mins = dt.dt.hour * 60 + dt.dt.minute
+    dist = (bar_mins - target_min).abs()
+    if (dist == 0).any():
+        return day_df.loc[dist == 0].iloc[0]
+    imin = int(dist.values.argmin())
+    if dist.iloc[imin] > max_minute_delta:
+        return None
+    return day_df.iloc[imin]
+
+
 def get_row_at_time(
     enriched_long_df: Optional[pd.DataFrame],
     ticker: str,
@@ -268,17 +449,18 @@ def get_row_at_time(
     df = enriched_long_df
     date_norm = pd.Timestamp(date).normalize()
     dt = pd.to_datetime(df[datetime_col])
-    ticker_upper = str(ticker).upper()
-    mask = (
-        (df[ticker_col].astype(str).str.upper() == ticker_upper)
-        & (dt.dt.normalize() == date_norm)
-        & (dt.dt.hour == t.hour)
-        & (dt.dt.minute == t.minute)
+    ticker_key = str(ticker).strip().upper()
+    mask_td = (df[ticker_col].astype(str).str.strip().str.upper() == ticker_key) & (
+        dt.dt.normalize() == date_norm
     )
-    subset = df.loc[mask]
-    if subset.empty:
+    day_df = df.loc[mask_td]
+    if day_df.empty:
         return None
-    return subset.iloc[0]
+    mask_exact = (dt.loc[day_df.index].dt.hour == t.hour) & (dt.loc[day_df.index].dt.minute == t.minute)
+    subset = day_df.loc[mask_exact]
+    if not subset.empty:
+        return subset.iloc[0]
+    return _nearest_bar_row_same_day(day_df, t, datetime_col=datetime_col)
 
 
 def report_entry_exit_column_gaps(
@@ -293,8 +475,8 @@ def report_entry_exit_column_gaps(
     see which columns enrichment did not produce (so they will be NaN in output).
 
     Note: "Entry" and "Exit" here are only the library snapshot columns (Entry_Col_*, Exit_Col_*)
-    taken from the enriched long at entry/exit time. Engine-added exit-only columns
-    (e.g. Col_MaxFavorableExcursion_R, Col_MAE_R) are computed by the engine and are not in this list.
+    taken from the enriched long at entry/exit time. Engine path metrics (e.g. Exit_Col_MAE_R,
+    Exit_Col_MaxFavorableExcursion_R) are computed at close and are not sourced from the long column list.
 
     Args:
         enriched_long_columns: list of column names from the enriched long (e.g. df.columns.tolist()).

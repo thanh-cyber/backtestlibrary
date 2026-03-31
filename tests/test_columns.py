@@ -112,14 +112,15 @@ class TestColumnsModule:
             assert trade_dict.get("Exit_Col_VWAP") == 100.2
 
     def test_apply_exit_columns_skips_missing(self):
-        """Missing or invalid values are skipped."""
+        """Missing or invalid values become NaN on the trade dict (full schema)."""
         with patch.object(columns, "_lib", return_value=_mock_lib(exit_=["Col_ATR14", "Col_VWAP"])):
             trade_dict = {}
             row = pd.Series({"Col_ATR14": 1.0})
             columns.apply_exit_columns(trade_dict, row)
             assert "Exit_Col_ATR14" in trade_dict
             assert trade_dict["Exit_Col_ATR14"] == 1.0
-            assert "Exit_Col_VWAP" not in trade_dict or trade_dict.get("Exit_Col_VWAP") is None
+            assert "Exit_Col_VWAP" in trade_dict
+            assert pd.isna(trade_dict["Exit_Col_VWAP"])
 
     def test_has_librarycolumn_bool(self):
         """has_librarycolumn returns bool."""

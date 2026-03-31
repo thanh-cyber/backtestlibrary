@@ -12,13 +12,7 @@ import pandas as pd
 from .bt_types import Position, RunResult, Strategy, TradeRecord
 from .analyzers import build_full_metrics
 from .sizers import RiskSizer
-from .columns import (
-    apply_entry_columns,
-    apply_exit_columns,
-    get_continuous_columns,
-    has_librarycolumn,
-    CONTINUOUS_COLUMN_PREFIX,
-)
+from .columns import apply_entry_columns, apply_exit_columns, has_librarycolumn
 from .trade_enrichment import enrich_trades_post_backtest
 
 
@@ -34,13 +28,68 @@ def _date_to_naive_for_parquet_filter(d):
     return d
 
 
+# Reg T–style long stock (simple): initial margin reserves 50% of notional; maintenance is 25%
+# (maintenance is not enforced intraday in this engine — only the initial fraction is reserved).
+LONG_STOCK_INITIAL_MARGIN_FRAC = 0.50
+LONG_STOCK_MAINTENANCE_MARGIN_FRAC = 0.25
+
+
+def maintenance_margin_per_share_us_stock(price: float) -> float:
+    """Per-share margin ladder for **short** stock positions (legacy tiered maintenance).
+
+    Used by ``default_margin_requirement_us_stock`` when ``side`` is not ``long``.
+    Same ladder as ``10%shortpm`` / prior ``run_strategy_parallel`` default.
+    """
+    if price is None or not (np.isfinite(price) and price > 0):
+        return float("inf")
+    if price < 2.50:
+        return max(price, 2.50)
+    if price < 5.00:
+        return price
+    if price < 16.67:
+        return max(0.30 * price, 5.00)
+    return 0.30 * price
+
+
+def default_margin_requirement_us_stock(
+    entry_price: float, shares: Union[int, float], side: str
+) -> float:
+    """Default ``margin_requirement`` callable: total margin reserved in $ (entry and exit).
+
+    **Long:** Reg T simple model — reserve **initial** margin =
+    ``LONG_STOCK_INITIAL_MARGIN_FRAC`` × position notional (|shares| × entry price).
+    Buying power ≈ equity / that fraction (e.g. 50% → max gross long ≈ 2× equity).
+    ``LONG_STOCK_MAINTENANCE_MARGIN_FRAC`` (25%) matches broker maintenance terminology but is
+    **not** enforced as a separate intraday margin call in this engine.
+
+    **Short:** unchanged — total = |shares| × ``maintenance_margin_per_share_us_stock(entry_price)``.
+    """
+    sh = float(shares) if shares is not None else 0.0
+    if sh == 0.0 or entry_price is None:
+        return 0.0
+    ep = float(entry_price)
+    if not np.isfinite(ep) or ep <= 0:
+        return 0.0
+    notional = abs(sh) * ep
+    if str(side).lower().strip() == "long":
+        return float(LONG_STOCK_INITIAL_MARGIN_FRAC) * notional
+    return abs(sh) * maintenance_margin_per_share_us_stock(ep)
+
+
 @dataclass
 class BacktestConfig:
     session_start: time
     session_end: time
     fixed_risk_per_trade: Optional[float] = None  # Fixed $ risk per trade (e.g. 500)
     risk_pct_per_trade: Optional[float] = None   # % of account risk per trade (e.g. 0.05 = 5%); used by RiskSizer
-    margin_requirement: Union[float, Callable[..., float]] = 1.0  # float = fraction of entry_value; callable(entry_price, shares, side) -> required_margin $
+    # Default: long = Reg T 50% initial on notional; short = tiered per-share maintenance
+    # (see default_margin_requirement_us_stock). Pass a float (e.g. 1.0) for
+    # legacy "fraction of entry notional" behavior instead.
+    margin_requirement: Union[float, Callable[..., float]] = default_margin_requirement_us_stock
+    # When True, ``available_balance`` for margin checks subtracts unrealized *losses* only (not gains)
+    # using the same mark as ``get_price(row, current_time)`` each bar. Unrealized profits do not add
+    # to free balance. When False, legacy incremental margin debits/credits only.
+    reduce_available_for_unrealized_losses: bool = False
     sizer: Optional[Any] = None  # Pluggable sizer (FixedSizeSizer, PercentOfEquitySizer, RiskSizer, KellySizer). If None, uses RiskSizer(config).
     float_cap_pct: float = 0.05
     equity_cap_pct: float = 0.10
@@ -65,7 +114,9 @@ class BacktestConfig:
     float_col: str = "Float_Numeric"
     exit_price_col: str = "Exit_Price"
     use_library_columns: bool = True  # When True, engine runs entry/exit columns from librarycolumn at entry/exit time; default on so columns are always included
-    defer_column_phase: bool = False  # When True, engine skips enrichment; run enrich_results(raw_results, ...) in a separate cell
+    # When True, skip post-run enrich_trades_post_backtest; call enrich_results(...) for full Phase 2
+    # (Entry/Exit/Continuous from wide data). In-loop entry/exit snapshots still run when use_library_columns.
+    defer_column_phase: bool = False
     # Diagnostic callbacks: on_entry_taken(entry, date), on_entry_skipped(entry, date, reason). reason: "row_missing"|"shares_zero"|"margin_insufficient"|"max_open_per_ticker"
     on_entry_taken: Optional[Any] = None
     on_entry_skipped: Optional[Any] = None
@@ -153,6 +204,16 @@ def _pl_r_for_side(side: str, entry_price: float, current_price: float, atr: flo
     if side.lower() == "short":
         return (entry_price - current_price) / atr
     return (current_price - entry_price) / atr
+
+
+def _unrealized_pnl_dollars(side: str, entry_price: float, mark: float, shares: float) -> float:
+    """Signed unrealized P&L in dollars (long: mark - entry; short: entry - mark)."""
+    sh = float(shares)
+    ep = float(entry_price)
+    px = float(mark)
+    if str(side).lower().strip() == "short":
+        return (ep - px) * sh
+    return (px - ep) * sh
 
 
 def _iter_times(start: time, end: time, step_seconds: int) -> list[time]:
@@ -280,9 +341,10 @@ class ChronologicalBacktestEngine:
         When a value is a Path (stream_from_cache), the year is read in date-chunks to avoid loading full year in RAM.
         chunk_days: number of trading days per chunk when streaming from Path (default 21 ~ 1 month).
         show_progress: if True, show a tqdm progress bar (0-100% by day or chunk).
-        enriched_long_by_year: optional dict[year_str, long DataFrame]. If provided, used for Entry/Exit/Continuous
-          instead of building from in-memory wide data. Use when streaming from path but you have pre-built long.
-        Entry/Exit/Continuous columns are applied in a post-backtest enrichment pass.
+        enriched_long_by_year: optional dict[year_str, long DataFrame]. If provided, used for richer Entry/Exit
+          row snapshots (get_row_at_time) instead of only the wide day row. Built from in-memory wide data when
+          missing and all years are DataFrames. Continuous_Col_* are never written here; use enrich_results (Phase 2).
+        When defer_column_phase is False, enrich_trades_post_backtest runs after each account for Phase 2 columns.
         """
         results: dict[str, dict[int, RunResult]] = {}
         iter_items = list(cleaned_year_data.items())
@@ -341,7 +403,11 @@ class ChronologicalBacktestEngine:
                 enriched_long_df = enriched_long_by_year.get(str(year)) if enriched_long_by_year else None
                 for starting_account in starting_accounts:
                     run_result = self._run_single_account_streamed(
-                        path, starting_account, strategy, chunk_days, pbar=pbar,
+                        path,
+                        starting_account,
+                        strategy,
+                        chunk_days,
+                        pbar=pbar,
                         enriched_long_df=enriched_long_df,
                     )
                     if not self.config.defer_column_phase:
@@ -378,7 +444,7 @@ class ChronologicalBacktestEngine:
         cleaned_year_data: dict,
         wide_path_by_year: dict,
     ) -> RunResult:
-        """Post-backtest enrichment: Entry_Col_*, Exit_Col_*, Continuous_Col_*."""
+        """Post-backtest enrichment: Entry_Col_*, Exit_Col_* (Phase 2)."""
         return enrich_trades_post_backtest(
             result,
             cleaned_year_data,
@@ -532,7 +598,18 @@ class ChronologicalBacktestEngine:
             check_exit = strategy.check_exit
             exits_with_context = _supports_positional_args(check_exit, 5)
             open_positions: list[Position] = []
+            use_loss_mtm = bool(
+                getattr(self.config, "reduce_available_for_unrealized_losses", False)
+            )
             for current_time in timeline:
+                if use_loss_mtm:
+                    available_balance = self._available_balance_for_margin_checks(
+                        account_balance,
+                        open_positions,
+                        row_lookup,
+                        get_price,
+                        current_time,
+                    )
                 # 1) Enter new positions in strict chronological order.
                 for entry in entries_by_time.get(current_time, []):
                     row = row_lookup.get(entry.row_index)
@@ -601,18 +678,6 @@ class ChronologicalBacktestEngine:
                         apply_entry_columns(entry_column_snapshot, row_for_entry)
                         entry_column_snapshot = entry_column_snapshot.copy()
 
-                    # Init continuous tracking from entry bar (when library has continuous columns)
-                    cont_cols = get_continuous_columns() if self.config.use_library_columns else []
-                    _continuous_entry = {}
-                    _continuous_max = {}
-                    _continuous_min = {}
-                    for col in cont_cols:
-                        v = _to_float(row_for_entry.get(col))
-                        if v is not None:
-                            _continuous_entry[col] = v
-                            _continuous_max[col] = v
-                            _continuous_min[col] = v
-
                     open_positions.append(
                         Position(
                             ticker=entry.ticker,
@@ -626,12 +691,18 @@ class ChronologicalBacktestEngine:
                             metadata=entry.metadata,
                             starting_account=float(starting_account),
                             entry_column_snapshot=entry_column_snapshot,
-                            _continuous_entry=_continuous_entry,
-                            _continuous_max=_continuous_max,
-                            _continuous_min=_continuous_min,
                         )
                     )
-                    available_balance -= required_margin
+                    if use_loss_mtm:
+                        available_balance = self._available_balance_for_margin_checks(
+                            account_balance,
+                            open_positions,
+                            row_lookup,
+                            get_price,
+                            current_time,
+                        )
+                    else:
+                        available_balance -= required_margin
 
                 # 2) Evaluate exits.
                 still_open: list[Position] = []
@@ -662,20 +733,6 @@ class ChronologicalBacktestEngine:
                             if current_min >= target_min and key not in pos._unrealized_captured:
                                 setattr(pos, f"unrealized_pl_{key}", current_pl_r)
                                 pos._unrealized_captured.add(key)
-
-                    # Continuous_Col_*: update max/min and capture At30min/At60min from enriched bar
-                    if get_row_at_time is not None and enriched_long_df is not None and self.config.use_library_columns:
-                        row_enriched_cur = get_row_at_time(enriched_long_df, pos.ticker, date, current_time)
-                        if row_enriched_cur is not None:
-                            for col in get_continuous_columns():
-                                v = _to_float(row_enriched_cur.get(col))
-                                if v is not None:
-                                    pos._continuous_max[col] = max(pos._continuous_max.get(col, v), v)
-                                    pos._continuous_min[col] = min(pos._continuous_min.get(col, v), v)
-                                    if pos.bars_since_entry == 29:
-                                        pos._continuous_at_30[col] = v
-                                    if pos.bars_since_entry == 59:
-                                        pos._continuous_at_60[col] = v
 
                     # Increment bar counter once per processed bar while position is open.
                     pos.bars_since_entry += 1
@@ -713,11 +770,6 @@ class ChronologicalBacktestEngine:
                         row_exit_enriched = get_row_at_time(
                             enriched_long_df, pos.ticker, date, current_time
                         )
-                    if row_exit_enriched is not None and self.config.use_library_columns:
-                        for col in get_continuous_columns():
-                            v = _to_float(row_exit_enriched.get(col))
-                            if v is not None:
-                                pos._continuous_exit[col] = v
                     # Enforce verbatim TP/SL fill prices:
                     # Even if a strategy's ExitSignal accidentally uses an OHLC price (e.g. open_bar),
                     # we treat Stop Loss / Take Profit as filled strictly at pos.stop_price / pos.target_price.
@@ -747,13 +799,14 @@ class ChronologicalBacktestEngine:
                         losing_trades += 1
 
                     account_balance += net_pnl
-                    mr = self.config.margin_requirement
-                    if callable(mr):
-                        margin_returned = mr(pos.entry_price, pos.shares, pos.side)
-                    else:
-                        margin_returned = pos.shares * pos.entry_price * mr
-                    available_balance += margin_returned + net_pnl
-                    available_balance = max(0.0, available_balance)
+                    if not use_loss_mtm:
+                        mr = self.config.margin_requirement
+                        if callable(mr):
+                            margin_returned = mr(pos.entry_price, pos.shares, pos.side)
+                        else:
+                            margin_returned = pos.shares * pos.entry_price * mr
+                        available_balance += margin_returned + net_pnl
+                        available_balance = max(0.0, available_balance)
                     trade.account_balance_after = account_balance
                     tdict = asdict(trade)
                     if self.config.use_library_columns:
@@ -761,19 +814,6 @@ class ChronologicalBacktestEngine:
                         if pos.entry_column_snapshot:
                             tdict.update(pos.entry_column_snapshot)
                         apply_exit_columns(tdict, row_for_exit)
-                        for col in get_continuous_columns():
-                            if col in pos._continuous_entry:
-                                tdict[f"{CONTINUOUS_COLUMN_PREFIX}{col}_Entry"] = pos._continuous_entry[col]
-                            if col in pos._continuous_exit:
-                                tdict[f"{CONTINUOUS_COLUMN_PREFIX}{col}_Exit"] = pos._continuous_exit[col]
-                            if col in pos._continuous_max:
-                                tdict[f"{CONTINUOUS_COLUMN_PREFIX}{col}_Max"] = pos._continuous_max[col]
-                            if col in pos._continuous_min:
-                                tdict[f"{CONTINUOUS_COLUMN_PREFIX}{col}_Min"] = pos._continuous_min[col]
-                            if col in pos._continuous_at_30:
-                                tdict[f"{CONTINUOUS_COLUMN_PREFIX}{col}_At30min"] = pos._continuous_at_30[col]
-                            if col in pos._continuous_at_60:
-                                tdict[f"{CONTINUOUS_COLUMN_PREFIX}{col}_At60min"] = pos._continuous_at_60[col]
                     trades_list.append(tdict)
 
                     if account_balance <= 0:
@@ -781,6 +821,14 @@ class ChronologicalBacktestEngine:
                         break
 
                 open_positions = still_open
+                if use_loss_mtm:
+                    available_balance = self._available_balance_for_margin_checks(
+                        account_balance,
+                        open_positions,
+                        row_lookup,
+                        get_price,
+                        current_time,
+                    )
 
             daily_equity.append(account_balance)
             if pbar is not None:
@@ -806,6 +854,34 @@ class ChronologicalBacktestEngine:
             name = analyzer.__class__.__name__.replace("Analyzer", "")
             result.analyzers[name] = analyzer.analyze(result)
         return result
+
+    def _available_balance_for_margin_checks(
+        self,
+        account_balance: float,
+        open_positions: list,
+        row_lookup: dict,
+        get_price: Callable,
+        current_time: time,
+    ) -> float:
+        """Free balance for margin: realized equity minus reserved margin minus unrealized losses only."""
+        mr_src = self.config.margin_requirement
+        reserved = 0.0
+        loss_haircut = 0.0
+        ab = float(account_balance)
+        for pos in open_positions:
+            row = row_lookup.get(pos.row_index)
+            if row is None:
+                continue
+            ep, sh = float(pos.entry_price), float(pos.shares)
+            if callable(mr_src):
+                reserved += float(mr_src(ep, sh, pos.side))
+            else:
+                reserved += sh * ep * float(mr_src)
+            mark = get_price(row, current_time)
+            if mark is not None and np.isfinite(mark) and float(mark) > 0:
+                u = _unrealized_pnl_dollars(pos.side, ep, float(mark), sh)
+                loss_haircut += max(0.0, -float(u))
+        return max(0.0, ab - reserved - loss_haircut)
 
     def _size_position(
         self,
@@ -914,44 +990,44 @@ class ChronologicalBacktestEngine:
             net_pnl=net_pnl,
             account_balance_after=0.0,  # set by caller after balance update
         )
-        # ---- Save elite exit analytics ----
-        trade.Col_MaxFavorableExcursion_R = float(pos.mfe_r)
-        trade.Col_MAE_R = float(pos.mae_r)  # Max Adverse Excursion (was misnamed Col_DistToInitialStop_R)
-        trade.Col_BarsToMFE = int(pos.bars_to_mfe)
-        trade.Col_BarsToMAE = int(pos.bars_to_mae)
-        trade.Col_MaxDrawdownFromMFE_R = float(pos.max_dd_from_mfe)
+        # ---- Save elite exit analytics (Exit_Col_* path metrics + exit-bar ATR/VWAP) ----
+        trade.Exit_Col_MaxFavorableExcursion_R = float(pos.mfe_r)
+        trade.Exit_Col_MAE_R = float(pos.mae_r)  # Max Adverse Excursion (was misnamed Col_DistToInitialStop_R)
+        trade.Exit_Col_BarsToMFE = int(pos.bars_to_mfe)
+        trade.Exit_Col_BarsToMAE = int(pos.bars_to_mae)
+        trade.Exit_Col_MaxDrawdownFromMFE_R = float(pos.max_dd_from_mfe)
         r = row_enriched if row_enriched is not None else row
         atr, vwap = _get_atr_vwap_from_row(r, exit_time)
         trade.Exit_Col_ATR14 = float(atr) if atr is not None else 0.0
         trade.Exit_Col_VWAP = float(vwap) if vwap is not None else 0.0
         if atr is not None and atr > 0 and pos.shares != 0:
             risk_dollar_unit = (pos.entry_price * abs(pos.shares)) / atr
-            trade.Col_FinalPL_R = float(net_pnl / risk_dollar_unit) if risk_dollar_unit > 0 else 0.0
+            trade.Exit_Col_FinalPL_R = float(net_pnl / risk_dollar_unit) if risk_dollar_unit > 0 else 0.0
             if vwap is not None:
                 if pos.side.lower() == "short":
-                    trade.Col_ExitVWAPDeviation_ATR = float((vwap - exit_price) / atr)
+                    trade.Exit_Col_ExitVWAPDeviation_ATR = float((vwap - exit_price) / atr)
                 else:
-                    trade.Col_ExitVWAPDeviation_ATR = float((exit_price - vwap) / atr)
-        trade.Col_HoldMinutes = int(hold_minutes)
-        trade.Col_ExitHourNumeric = float(exit_time.hour + exit_time.minute / 60.0)
-        trade.Col_BarsSinceEntry = int(pos.bars_since_entry)
-        trade.Col_PosSize_PctAccount = (
+                    trade.Exit_Col_ExitVWAPDeviation_ATR = float((exit_price - vwap) / atr)
+        trade.Exit_Col_HoldMinutes = int(hold_minutes)
+        trade.Exit_Col_ExitHourNumeric = float(exit_time.hour + exit_time.minute / 60.0)
+        trade.Exit_Col_BarsSinceEntry = int(pos.bars_since_entry)
+        trade.Exit_Col_PosSize_PctAccount = (
             float((abs(pos.shares) * pos.entry_price) / pos.starting_account * 100.0)
             if pos.starting_account > 0
             else 0.0
         )
-        trade.Col_UnrealizedPL_1000 = float(pos.unrealized_pl_1000)
-        trade.Col_UnrealizedPL_1030 = float(pos.unrealized_pl_1030)
-        trade.Col_UnrealizedPL_1100 = float(pos.unrealized_pl_1100)
-        trade.Col_UnrealizedPL_1130 = float(pos.unrealized_pl_1130)
-        trade.Col_UnrealizedPL_1200 = float(pos.unrealized_pl_1200)
-        trade.Col_UnrealizedPL_1230 = float(pos.unrealized_pl_1230)
-        trade.Col_UnrealizedPL_1300 = float(pos.unrealized_pl_1300)
-        trade.Col_UnrealizedPL_1330 = float(pos.unrealized_pl_1330)
-        trade.Col_UnrealizedPL_1400 = float(pos.unrealized_pl_1400)
-        trade.Col_UnrealizedPL_1430 = float(pos.unrealized_pl_1430)
-        trade.Col_UnrealizedPL_1500 = float(pos.unrealized_pl_1500)
-        trade.Col_UnrealizedPL_1530 = float(pos.unrealized_pl_1530)
-        trade.Col_UnrealizedPL_1600 = float(pos.unrealized_pl_1600)
+        trade.Exit_Col_UnrealizedPL_1000 = float(pos.unrealized_pl_1000)
+        trade.Exit_Col_UnrealizedPL_1030 = float(pos.unrealized_pl_1030)
+        trade.Exit_Col_UnrealizedPL_1100 = float(pos.unrealized_pl_1100)
+        trade.Exit_Col_UnrealizedPL_1130 = float(pos.unrealized_pl_1130)
+        trade.Exit_Col_UnrealizedPL_1200 = float(pos.unrealized_pl_1200)
+        trade.Exit_Col_UnrealizedPL_1230 = float(pos.unrealized_pl_1230)
+        trade.Exit_Col_UnrealizedPL_1300 = float(pos.unrealized_pl_1300)
+        trade.Exit_Col_UnrealizedPL_1330 = float(pos.unrealized_pl_1330)
+        trade.Exit_Col_UnrealizedPL_1400 = float(pos.unrealized_pl_1400)
+        trade.Exit_Col_UnrealizedPL_1430 = float(pos.unrealized_pl_1430)
+        trade.Exit_Col_UnrealizedPL_1500 = float(pos.unrealized_pl_1500)
+        trade.Exit_Col_UnrealizedPL_1530 = float(pos.unrealized_pl_1530)
+        trade.Exit_Col_UnrealizedPL_1600 = float(pos.unrealized_pl_1600)
         return net_pnl, trade
 

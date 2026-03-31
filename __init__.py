@@ -8,7 +8,11 @@ from .data import GapperDataLoader, LoaderConfig, ParquetDataLoader, ParquetLoad
 from .engine import (
     BacktestConfig,
     ChronologicalBacktestEngine,
+    LONG_STOCK_INITIAL_MARGIN_FRAC,
+    LONG_STOCK_MAINTENANCE_MARGIN_FRAC,
     commission_per_order_us_stock_fixed,
+    default_margin_requirement_us_stock,
+    maintenance_margin_per_share_us_stock,
 )
 from .analyzers import build_full_metrics
 from .monte_carlo import run_monte_carlo
@@ -41,7 +45,7 @@ from .feed import (
     resample_wide_intraday,
     validate_feed,
 )
-from .io import write_trades_csv, write_trades_excel
+from .io import reorder_trades_dataframe, write_trades_csv, write_trades_excel
 from .trade_enrichment import enrich_results
 from .plotting import plot_equity_drawdown, plot_result, plot_trade_pnl
 from .librarycolumn_enrichment import (
@@ -68,6 +72,10 @@ __all__ = [
     "Analyzer",
     "BacktestConfig",
     "commission_per_order_us_stock_fixed",
+    "default_margin_requirement_us_stock",
+    "LONG_STOCK_INITIAL_MARGIN_FRAC",
+    "LONG_STOCK_MAINTENANCE_MARGIN_FRAC",
+    "maintenance_margin_per_share_us_stock",
     "FixedSizeSizer",
     "KellySizer",
     "PercentOfEquitySizer",
@@ -94,6 +102,7 @@ __all__ = [
     "merge_exit_metrics_into_backtest_data",
     "attach_exit_metrics_from_minute_bars",
     "attach_exit_metrics_from_intraday_data",
+    "reorder_trades_dataframe",
     "write_trades_csv",
     "write_trades_excel",
     "enrich_results",

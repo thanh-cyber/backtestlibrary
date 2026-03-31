@@ -14,21 +14,43 @@ _CORE_TRADE_COLUMNS = (
     "borrow_cost", "net_pnl", "account_balance_after",
 )
 
-# Engine-computed exit-only columns (written in _close_trade). Included in exit CSV so exit has more columns than entry.
+# Engine-computed path/exit analytics (written in _close_trade; export names are Exit_Col_*).
 _ENGINE_EXIT_ONLY_COLUMNS = (
-    "Col_MaxFavorableExcursion_R", "Col_MAE_R", "Col_BarsToMFE", "Col_BarsToMAE",
-    "Col_MaxDrawdownFromMFE_R", "Col_FinalPL_R", "Col_HoldMinutes", "Col_ExitHourNumeric",
-    "Col_UnrealizedPL_1000", "Col_UnrealizedPL_1030", "Col_UnrealizedPL_1100", "Col_UnrealizedPL_1130",
-    "Col_UnrealizedPL_1200", "Col_UnrealizedPL_1230", "Col_UnrealizedPL_1300", "Col_UnrealizedPL_1330",
-    "Col_UnrealizedPL_1400", "Col_UnrealizedPL_1430", "Col_UnrealizedPL_1500", "Col_UnrealizedPL_1530",
-    "Col_UnrealizedPL_1600",
-    "Col_ExitVWAPDeviation_ATR", "Col_BarsSinceEntry", "Col_PosSize_PctAccount",
+    "Exit_Col_MaxFavorableExcursion_R", "Exit_Col_MAE_R", "Exit_Col_BarsToMFE", "Exit_Col_BarsToMAE",
+    "Exit_Col_MaxDrawdownFromMFE_R", "Exit_Col_FinalPL_R", "Exit_Col_HoldMinutes", "Exit_Col_ExitHourNumeric",
+    "Exit_Col_UnrealizedPL_1000", "Exit_Col_UnrealizedPL_1030", "Exit_Col_UnrealizedPL_1100", "Exit_Col_UnrealizedPL_1130",
+    "Exit_Col_UnrealizedPL_1200", "Exit_Col_UnrealizedPL_1230", "Exit_Col_UnrealizedPL_1300", "Exit_Col_UnrealizedPL_1330",
+    "Exit_Col_UnrealizedPL_1400", "Exit_Col_UnrealizedPL_1430", "Exit_Col_UnrealizedPL_1500", "Exit_Col_UnrealizedPL_1530",
+    "Exit_Col_UnrealizedPL_1600",
+    "Exit_Col_ExitVWAPDeviation_ATR", "Exit_Col_BarsSinceEntry", "Exit_Col_PosSize_PctAccount",
 )
 
 
 def get_engine_exit_only_columns() -> List[str]:
-    """Return list of engine-computed exit-only column names (added in _close_trade, not from enriched long)."""
+    """Return engine-computed Exit_Col_* names (path metrics + exit VWAP/ATR fields from _close_trade)."""
     return list(_ENGINE_EXIT_ONLY_COLUMNS)
+
+
+def ordered_trades_export_columns(columns: list) -> List[str]:
+    """
+    Column order for exports: all non-snapshot columns first (original order), then Entry_Col_*,
+    Exit_Col_*, Continuous_Col_* (each group sorted alphabetically).
+    """
+    cols = list(columns)
+    entry = sorted(c for c in cols if str(c).startswith("Entry_"))
+    exit_c = sorted(c for c in cols if str(c).startswith("Exit_"))
+    cont = sorted(c for c in cols if str(c).startswith("Continuous_"))
+    tagged = set(entry) | set(exit_c) | set(cont)
+    rest = [c for c in cols if c not in tagged]
+    return rest + entry + exit_c + cont
+
+
+def reorder_trades_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Reorder columns for Excel/CSV export (see ``ordered_trades_export_columns``)."""
+    if df is None or getattr(df, "empty", True):
+        return df
+    order = ordered_trades_export_columns(list(df.columns))
+    return df[order].copy()
 
 
 def write_trades_csv(

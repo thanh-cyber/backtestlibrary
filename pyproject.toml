@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 plot = ["matplotlib>=3.6"]
-librarycolumn = ["librarycolumn>=0.1.0"]
+librarycolumn = ["librarycolumn>=0.1.0", "yfinance>=0.2.65"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

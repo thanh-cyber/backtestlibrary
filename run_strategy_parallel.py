@@ -31,7 +31,6 @@ from datetime import time
 from pathlib import Path
 from typing import Any, Optional
 
-import numpy as np
 import pandas as pd
 
 
@@ -48,23 +47,6 @@ PROJECT_ROOT = _ensure_project_root_on_path()
 from backtestlibrary import BacktestConfig, ChronologicalBacktestEngine  # noqa: E402
 from backtestdata import load_cleaned_year_data  # noqa: E402
 from backtestdata.loader import get_parquet_dir  # noqa: E402
-
-
-# Default maintenance margin per share (ticker price) — used when margin_requirement is this callable
-def _default_maintenance_margin_per_share(price: float) -> float:
-    if price is None or not (np.isfinite(price) and price > 0):
-        return float("inf")
-    if price < 2.50:
-        return max(price, 2.50)
-    if price < 5.00:
-        return price
-    if price < 16.67:
-        return max(0.30 * price, 5.00)
-    return 0.30 * price
-
-
-def _default_margin_requirement_callable(entry_price: float, shares: int, side: str) -> float:
-    return shares * _default_maintenance_margin_per_share(entry_price)
 
 
 def _parse_time(s: str) -> time:
@@ -134,7 +116,6 @@ def _run_one_year(cfg: YearRunConfig) -> tuple[int, str]:
             timeline_step_seconds=60,
             use_library_columns=True,
             defer_column_phase=True,
-            margin_requirement=_default_margin_requirement_callable,
             **risk_kw,
         )
     )
