@@ -72,7 +72,6 @@ class Position:
 @dataclass
 class TradeRecord:
     ticker: str
-    side: str
     date: pd.Timestamp
     entry_time: str
     entry_price: float
@@ -120,6 +119,7 @@ class TradeRecord:
     # Metrics at exit bar (for exit columns / downstream use)
     Exit_Col_ATR14: float = 0.0
     Exit_Col_VWAP: float = 0.0
+    side: str = "long"
 
 
 @dataclass

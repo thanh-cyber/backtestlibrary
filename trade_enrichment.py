@@ -308,7 +308,18 @@ def _infer_trade_side(trade: dict[str, Any]) -> str:
     ):
         long_pnl = shares * (exit_price - entry_price)
         short_pnl = shares * (entry_price - exit_price)
-        if abs(gross_pnl - short_pnl) < abs(gross_pnl - long_pnl):
+        # Tolerate tiny numeric/fee-related noise around near-flat outcomes.
+        # If both formulas are effectively tied, use raw price direction.
+        tol = max(1e-9, abs(shares) * 1e-6)
+        d_short = abs(gross_pnl - short_pnl)
+        d_long = abs(gross_pnl - long_pnl)
+        if abs(d_short - d_long) <= tol:
+            if exit_price < entry_price:
+                return "short"
+            if exit_price > entry_price:
+                return "long"
+            return "long"
+        if d_short < d_long:
             return "short"
     return "long"
 

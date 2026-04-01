@@ -45,3 +45,13 @@ def test_get_enrich_columns_handles_dataframe_year_map_without_truthiness_error(
     cleaned = {"2026": pd.DataFrame({"Ticker": ["AAPL"], "Date": [pd.Timestamp("2026-01-02")]})}
     out = _get_enrich_columns_for_year_static("2026", cleaned, {})
     assert out is None
+
+
+def test_infer_trade_side_ambiguous_near_zero_uses_price_direction():
+    trade = {
+        "shares": 100,
+        "entry_price": 10.0,
+        "exit_price": 9.99,
+        "gross_pnl": 0.0,  # near-flat after costs can look ambiguous
+    }
+    assert _infer_trade_side(trade) == "short"

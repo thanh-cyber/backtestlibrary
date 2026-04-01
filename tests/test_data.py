@@ -109,3 +109,15 @@ class TestResolveSplitSessionCachePaths:
         out = data.resolve_split_session_cache_paths(str(cache_dir), [year])
 
         assert out["rth"][str(year)] == rth_file.resolve()
+
+    def test_default_prefix_precedence_wins_when_normal_and_vwap_both_exist(self, tmp_path):
+        cache_dir = tmp_path
+        year = 2027
+        normal = cache_dir / f"normal_pm_{year}.parquet"
+        legacy = cache_dir / f"vwap_pm_{year}.parquet"
+        normal.touch()
+        legacy.touch()
+
+        out = data.resolve_split_session_cache_paths(str(cache_dir), [year])
+
+        assert out["pm"][str(year)] == normal.resolve()
