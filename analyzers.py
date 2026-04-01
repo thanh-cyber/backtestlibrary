@@ -260,10 +260,14 @@ class StreakAnalyzer(Analyzer):
                 cur_win += 1
                 max_win_streak = max(max_win_streak, cur_win)
                 cur_loss = 0
-            else:
+            elif x < 0:
                 cur_loss += 1
                 max_loss_streak = max(max_loss_streak, cur_loss)
                 cur_win = 0
+            else:
+                # Flat trade breaks both streaks.
+                cur_win = 0
+                cur_loss = 0
         return {"max_win_streak": max_win_streak, "max_loss_streak": max_loss_streak}
 
 

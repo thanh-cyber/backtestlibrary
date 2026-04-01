@@ -289,6 +289,41 @@ class TestEngineIntegration:
         first = r.trades.iloc[0]
         assert "Exit_Col_ATR14" in first.index or "Exit_Col_VWAP" in first.index
 
+    def test_trade_side_column_is_persisted_for_short_positions(self, sample_cleaned_year_data):
+        def find_entries(day_df, timeline, get_price, day_context=None):
+            return [
+                EntryCandidate(
+                    ticker="AAPL",
+                    row_index=day_df.index[0],
+                    entry_time=time(9, 46),
+                    entry_price=100.5,
+                    side="short",
+                    stop_price=105.5,
+                    target_price=95.0,
+                )
+            ]
+
+        def check_exit(pos, row, current_time, get_price, day_context=None):
+            return None
+
+        class S:
+            pass
+
+        S.find_entries_for_day = staticmethod(find_entries)
+        S.check_exit = staticmethod(check_exit)
+
+        cfg = BacktestConfig(
+            session_start=time(9, 30),
+            session_end=time(16, 0),
+            risk_pct_per_trade=0.05,
+        )
+        engine = ChronologicalBacktestEngine(cfg)
+        results, _, _ = engine.run(sample_cleaned_year_data, S(), [100_000])
+        trades = results["2022"][100_000].trades
+        assert not trades.empty
+        assert "side" in trades.columns
+        assert trades["side"].iloc[0] == "short"
+
 
 class TestIBKRFixedCommission:
     """IBKR US stock Fixed commission component (per order); see BacktestConfig defaults."""

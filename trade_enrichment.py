@@ -283,6 +283,36 @@ def _apply_elite_exit_from_slice(
                 tdict["Col_ExitVWAPDeviation_ATR"] = float((exit_price - vwap) / atr_exit)
 
 
+def _infer_trade_side(trade: dict[str, Any]) -> str:
+    """Infer long/short side from trade fields.
+
+    Priority:
+    1) explicit `side` when present;
+    2) gross PnL consistency with long vs short formulas;
+    3) conservative fallback to long.
+    """
+    explicit = trade.get("side")
+    if explicit is not None and str(explicit).strip().lower() in {"long", "short"}:
+        return str(explicit).strip().lower()
+
+    shares = _to_float(trade.get("shares"))
+    entry_price = _to_float(trade.get("entry_price"))
+    exit_price = _to_float(trade.get("exit_price"))
+    gross_pnl = _to_float(trade.get("gross_pnl"))
+    if (
+        shares is not None
+        and shares > 0
+        and entry_price is not None
+        and exit_price is not None
+        and gross_pnl is not None
+    ):
+        long_pnl = shares * (exit_price - entry_price)
+        short_pnl = shares * (entry_price - exit_price)
+        if abs(gross_pnl - short_pnl) < abs(gross_pnl - long_pnl):
+            return "short"
+    return "long"
+
+
 def _enrich_long_per_ticker_date(long_df: pd.DataFrame) -> pd.DataFrame:
     """
     Run librarycolumn enrichment per (Ticker, Date) group, since add_all_columns
@@ -432,7 +462,9 @@ def _get_enrich_columns_for_year_static(
     """Return column list for parquet read. If load_full_columns=False, exclude ATR14/VWAP to save memory."""
     if load_full_columns:
         return None  # None = load all columns
-    data = cleaned_year_data.get(yr) or cleaned_year_data.get(str(yr))
+    data = cleaned_year_data.get(yr)
+    if data is None:
+        data = cleaned_year_data.get(str(yr))
     path = wide_path_by_year.get(yr) or wide_path_by_year.get(str(yr))
     if path is None and isinstance(data, (Path, str)):
         path = data
@@ -763,7 +795,7 @@ def enrich_trades_post_backtest(
                             entry_price = tdict.get("entry_price")
                             exit_price = tdict.get("exit_price")
                             net_pnl = tdict.get("net_pnl", 0.0)
-                            side = "long" if (tdict.get("shares") or 0) > 0 else "short"
+                            side = _infer_trade_side(tdict)
                             if entry_price is not None and exit_price is not None:
                                 _apply_elite_exit_from_slice(
                                     tdict, slice_df, float(entry_price), float(exit_price),

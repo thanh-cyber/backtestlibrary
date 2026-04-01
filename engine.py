@@ -897,6 +897,7 @@ class ChronologicalBacktestEngine:
 
         trade = TradeRecord(
             ticker=pos.ticker,
+            side=pos.side,
             date=pd.Timestamp(date),
             entry_time=f"{pos.entry_time.hour:02d}:{pos.entry_time.minute:02d}",
             entry_price=pos.entry_price,
@@ -954,4 +955,3 @@ class ChronologicalBacktestEngine:
         trade.Col_UnrealizedPL_1530 = float(pos.unrealized_pl_1530)
         trade.Col_UnrealizedPL_1600 = float(pos.unrealized_pl_1600)
         return net_pnl, trade
-

@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
+from backtestlibrary.bt_types import RunResult
 from backtestlibrary import columns
 
 
@@ -124,3 +125,29 @@ class TestColumnsModule:
     def test_has_librarycolumn_bool(self):
         """has_librarycolumn returns bool."""
         assert isinstance(columns.has_librarycolumn(), bool)
+
+    def test_attach_continuous_tracking_raises_clear_error_when_ticker_missing(self):
+        mock_lib = type("MockLib", (), {"add_continuous_tracking": lambda *a, **k: pd.DataFrame()})()
+        result = RunResult(
+            final_balance=100_000.0,
+            total_return_pct=0.0,
+            total_trades=1,
+            winning_trades=0,
+            losing_trades=1,
+            total_pnl=-10.0,
+            trades=pd.DataFrame(
+                {
+                    "date": [pd.Timestamp("2026-01-02")],
+                    "entry_time": ["09:30"],
+                    "exit_time": ["09:31"],
+                    "net_pnl": [-10.0],
+                }
+            ),
+            daily_equity=[100_000.0, 99_990.0],
+        )
+        enriched_long = pd.DataFrame(
+            {"Ticker": ["AAPL"], "datetime": [pd.Timestamp("2026-01-02 09:30")]}
+        )
+        with patch.object(columns, "_lib", return_value=mock_lib):
+            with pytest.raises(ValueError, match="missing ticker column"):
+                columns.attach_continuous_tracking(result, enriched_long)

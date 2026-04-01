@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from backtestlibrary import data
 
@@ -86,3 +87,25 @@ class TestPivotLongToWide:
         assert "9:32" in out.columns
         assert len(out) == 1
         assert out["9:30"].iloc[0] == 100.0
+
+
+class TestResolveSplitSessionCachePaths:
+    def test_default_prefix_finds_normal_flat_layout(self, tmp_path):
+        cache_dir = tmp_path
+        year = 2026
+        pm_file = cache_dir / f"normal_pm_{year}.parquet"
+        pm_file.touch()
+
+        out = data.resolve_split_session_cache_paths(str(cache_dir), [year])
+
+        assert out["pm"][str(year)] == pm_file.resolve()
+
+    def test_legacy_vwap_fallback_is_preserved(self, tmp_path):
+        cache_dir = tmp_path
+        year = 2025
+        rth_file = cache_dir / f"vwap_rth_{year}.parquet"
+        rth_file.touch()
+
+        out = data.resolve_split_session_cache_paths(str(cache_dir), [year])
+
+        assert out["rth"][str(year)] == rth_file.resolve()

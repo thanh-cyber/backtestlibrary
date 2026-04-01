@@ -72,6 +72,7 @@ class Position:
 @dataclass
 class TradeRecord:
     ticker: str
+    side: str
     date: pd.Timestamp
     entry_time: str
     entry_price: float

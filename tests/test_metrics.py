@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from backtestlibrary.analyzers import _sharpe, _sortino, build_full_metrics
+from backtestlibrary.analyzers import StreakAnalyzer, _sharpe, _sortino, build_full_metrics
 
 
 class TestSharpe:
@@ -85,3 +85,12 @@ class TestCagrRegression:
         years_equiv = len(daily_ret) / 252.0
         cagr = ((end / start) ** (1 / years_equiv) - 1) * 100.0
         assert 9.0 < cagr < 11.0
+
+
+class TestStreakAnalyzer:
+    def test_zero_pnl_breaks_streaks(self):
+        trades = pd.DataFrame({"net_pnl": [10, 5, 0, -1, -2, 0, -3]})
+        result = type("R", (), {"trades": trades})()
+        out = StreakAnalyzer().analyze(result)
+        assert out["max_win_streak"] == 2
+        assert out["max_loss_streak"] == 2
