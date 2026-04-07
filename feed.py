@@ -241,6 +241,15 @@ def resample_wide_intraday(
             if t_m <= m < t_m + rule_minutes:
                 target_to_sources[t_label].append(tc)
                 break
+    # Precompute volume bucket membership once (shared by all rows).
+    vol_minutes = {c: _minute_of_day(_vol_time_part(c)) for c in vol_cols}
+    target_to_vol_sources: dict[str, list[str]] = {lb: [] for lb in target_labels}
+    for i, t_label in enumerate(target_labels):
+        t_m = target_minutes[i]
+        target_to_vol_sources[t_label] = [
+            c for c, m in vol_minutes.items()
+            if t_m <= m < t_m + rule_minutes
+        ]
 
     out_rows = []
     for idx, row in df_wide.iterrows():
@@ -266,12 +275,8 @@ def resample_wide_intraday(
                 row_dict[t_label] = vals.mean()
             else:
                 row_dict[t_label] = vals.iloc[-1]
-        for i, t_label in enumerate(target_labels):
-            t_m = target_minutes[i]
-            vol_srcs = [
-                c for c in vol_cols
-                if t_m <= _minute_of_day(_vol_time_part(c)) < t_m + rule_minutes
-            ]
+        for t_label in target_labels:
+            vol_srcs = target_to_vol_sources[t_label]
             if not vol_srcs:
                 if vol_cols:
                     row_dict[f"Vol {t_label}"] = np.nan
