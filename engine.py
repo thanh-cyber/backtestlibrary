@@ -989,6 +989,7 @@ class ChronologicalBacktestEngine:
             borrow_cost=borrow_cost,
             net_pnl=net_pnl,
             account_balance_after=0.0,  # set by caller after balance update
+            side=pos.side,
         )
         # ---- Save elite exit analytics (Exit_Col_* path metrics + exit-bar ATR/VWAP) ----
         trade.Exit_Col_MaxFavorableExcursion_R = float(pos.mfe_r)

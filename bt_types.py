@@ -109,6 +109,7 @@ class TradeRecord:
     # Snapshot at exit bar (same prefix; from apply_exit_columns when use_library_columns)
     Exit_Col_ATR14: float = 0.0
     Exit_Col_VWAP: float = 0.0
+    side: str = "long"
 
 
 @dataclass

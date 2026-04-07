@@ -529,7 +529,7 @@ class ParquetDataLoader:
         cache_dir: str,
         years: list[int],
         *,
-        cache_prefix: str = "vwap",
+        cache_prefix: str = "normal",
     ) -> dict[str, dict[str, Path]]:
         """Resolve split-session cache paths without loading data.
 
@@ -541,7 +541,7 @@ class ParquetDataLoader:
         """
         cache_dir_p = Path(cache_dir)
         by_session: dict[str, dict[str, Path]] = {"pm": {}, "rth": {}, "ah": {}}
-        prefix = (cache_prefix or "vwap").strip() or "vwap"
+        prefix = (cache_prefix or "normal").strip() or "normal"
 
         for year in years:
             ys = str(year)
@@ -551,12 +551,15 @@ class ParquetDataLoader:
                 # e.g. {cache_dir}/pm/normal_pm_2026.parquet
                 p_sub_prefixed = cache_dir_p / sess / f"{prefix}_{sess}_{year}.parquet"
                 p_flat = cache_dir_p / f"{prefix}_{sess}_{year}.parquet"
+                p_flat_legacy = cache_dir_p / f"vwap_{sess}_{year}.parquet"
                 if p_sub.exists():
                     by_session[sess][ys] = p_sub.resolve()
                 elif p_sub_prefixed.exists():
                     by_session[sess][ys] = p_sub_prefixed.resolve()
                 elif p_flat.exists():
                     by_session[sess][ys] = p_flat.resolve()
+                elif p_flat_legacy.exists():
+                    by_session[sess][ys] = p_flat_legacy.resolve()
 
         return by_session
 
@@ -1107,7 +1110,7 @@ def resolve_split_session_cache_paths(
     cache_dir: str,
     years: list[int],
     *,
-    cache_prefix: str = "vwap",
+    cache_prefix: str = "normal",
 ) -> dict[str, dict[str, Path]]:
     """Resolve split-session cache paths without loading data.
 
@@ -1119,7 +1122,7 @@ def resolve_split_session_cache_paths(
     """
     cache_dir_p = Path(cache_dir)
     by_session: dict[str, dict[str, Path]] = {"pm": {}, "rth": {}, "ah": {}}
-    prefix = (cache_prefix or "vwap").strip() or "vwap"
+    prefix = (cache_prefix or "normal").strip() or "normal"
 
     for year in years:
         ys = str(year)
@@ -1127,12 +1130,15 @@ def resolve_split_session_cache_paths(
             p_sub = cache_dir_p / sess / f"{year}.parquet"
             p_sub_prefixed = cache_dir_p / sess / f"{prefix}_{sess}_{year}.parquet"
             p_flat = cache_dir_p / f"{prefix}_{sess}_{year}.parquet"
+            p_flat_legacy = cache_dir_p / f"vwap_{sess}_{year}.parquet"
             if p_sub.exists():
                 by_session[sess][ys] = p_sub.resolve()
             elif p_sub_prefixed.exists():
                 by_session[sess][ys] = p_sub_prefixed.resolve()
             elif p_flat.exists():
                 by_session[sess][ys] = p_flat.resolve()
+            elif p_flat_legacy.exists():
+                by_session[sess][ys] = p_flat_legacy.resolve()
 
     return by_session
 

@@ -192,6 +192,40 @@ def _to_float(x: Any) -> Optional[float]:
     return xv if np.isfinite(xv) else None
 
 
+def _infer_trade_side_from_values(
+    *,
+    explicit_side: Any,
+    shares: Any,
+    entry_price: Any,
+    exit_price: Any,
+    gross_pnl: Any,
+) -> str:
+    """Infer long/short side with explicit side precedence and PnL consistency fallback."""
+    if explicit_side is not None and str(explicit_side).strip().lower() in {"long", "short"}:
+        return str(explicit_side).strip().lower()
+
+    sh = _to_float(shares)
+    ep = _to_float(entry_price)
+    xp = _to_float(exit_price)
+    gp = _to_float(gross_pnl)
+    if sh is not None and sh > 0 and ep is not None and xp is not None and gp is not None:
+        long_pnl = sh * (xp - ep)
+        short_pnl = sh * (ep - xp)
+        tol = max(1e-9, abs(sh) * 1e-6)
+        d_short = abs(gp - short_pnl)
+        d_long = abs(gp - long_pnl)
+        if abs(d_short - d_long) <= tol:
+            if xp < ep:
+                return "short"
+            if xp > ep:
+                return "long"
+            return "long"
+        if d_short < d_long:
+            return "short"
+        return "long"
+    return "short" if (sh is not None and sh < 0) else "long"
+
+
 def _compute_elite_metrics_py(
     closes: np.ndarray,
     atrs: np.ndarray,
@@ -934,7 +968,15 @@ def _vectorized_entry_exit_elite_from_index(
             exit_price = exit_price_arr[p]
             net_pnl = net_pnl_arr[p] if np.isfinite(net_pnl_arr[p]) else 0.0
             shares_val = shares_arr[p] if np.isfinite(shares_arr[p]) else 0.0
-            side = "long" if shares_val > 0 else "short"
+            gross_pnl_val = out.iloc[p].get("gross_pnl", np.nan)
+            explicit_side = out.iloc[p].get("side", None)
+            side = _infer_trade_side_from_values(
+                explicit_side=explicit_side,
+                shares=shares_val,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                gross_pnl=gross_pnl_val,
+            )
             if not (np.isfinite(entry_price) and np.isfinite(exit_price)):
                 continue
             stop_price = float(stop_arr[p]) if np.isfinite(stop_arr[p]) else None
@@ -1409,7 +1451,9 @@ def _get_enrich_columns_for_year_static(
     """Return column list for parquet read. If load_full_columns=False, exclude ATR14/VWAP to save memory."""
     if load_full_columns:
         return None  # None = load all columns
-    data = cleaned_year_data.get(yr) or cleaned_year_data.get(str(yr))
+    data = cleaned_year_data.get(yr)
+    if data is None:
+        data = cleaned_year_data.get(str(yr))
     path = wide_path_by_year.get(yr) or wide_path_by_year.get(str(yr))
     if path is None and isinstance(data, (Path, str)):
         path = data
