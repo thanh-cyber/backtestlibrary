@@ -11,9 +11,11 @@ import hashlib
 import io
 import os
 import re
+import shutil
+import tempfile
 import warnings
 from contextlib import redirect_stderr, redirect_stdout
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
@@ -764,6 +766,7 @@ def _vectorized_entry_exit_elite_from_index(
     exit_time_col: str,
     *,
     datetime_col: str = _EL_DATETIME_COL,
+    day_cache: Optional[dict[tuple[str, pd.Timestamp], dict[str, Any]]] = None,
 ) -> pd.DataFrame:
     """Vectorized Entry_/Exit_ snapshots + per-row elite slice (no chronological dependency across trades)."""
     out = tr_slice.copy()
@@ -826,10 +829,39 @@ def _vectorized_entry_exit_elite_from_index(
         out = pd.concat([out, pd.DataFrame({k: v for k, v in missing.items()}, index=out.index)], axis=1)
 
     dc = "date" if "date" in out.columns else "Date"
+    # One-time column location map for hot loop writes.
+    col_locs: dict[str, int] = {}
+    for i, c in enumerate(out.columns):
+        if c not in col_locs:
+            col_locs[c] = i
+
     tid = out[ticker_col].astype(str).str.strip().str.upper()
     dn = pd.to_datetime(out[dc], errors="coerce").map(_calendar_date_key)
     em = out[entry_time_col].map(_time_to_minutes_optional).to_numpy(dtype=np.float64)
     xm = out[exit_time_col].map(_time_to_minutes_optional).to_numpy(dtype=np.float64)
+    def _series_or_default(name: str, default: float) -> pd.Series:
+        v = out.get(name, default)
+        if isinstance(v, pd.Series):
+            return v
+        return pd.Series(v, index=out.index)
+
+    entry_price_s = _series_or_default("entry_price", np.nan)
+    exit_price_s = _series_or_default("exit_price", np.nan)
+    net_pnl_s = _series_or_default("net_pnl", 0.0)
+    shares_s = _series_or_default("shares", 0.0)
+    initial_stop_s = _series_or_default("initial_stop", np.nan)
+    stop_price_s = _series_or_default("stop_price", np.nan)
+    initial_stop_legacy_s = _series_or_default("InitialStop", np.nan)
+    take_profit_s = _series_or_default("take_profit", np.nan)
+    target_price_s = _series_or_default("target_price", np.nan)
+    take_profit_legacy_s = _series_or_default("TakeProfit", np.nan)
+
+    entry_price_arr = pd.to_numeric(entry_price_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    exit_price_arr = pd.to_numeric(exit_price_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    net_pnl_arr = pd.to_numeric(net_pnl_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    shares_arr = pd.to_numeric(shares_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    stop_arr = pd.to_numeric(initial_stop_s.fillna(stop_price_s).fillna(initial_stop_legacy_s), errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    target_arr = pd.to_numeric(take_profit_s.fillna(target_price_s).fillna(take_profit_legacy_s), errors="coerce").to_numpy(dtype=np.float64, copy=False)
     pos = np.arange(len(out), dtype=np.int64)
     work_i = pd.DataFrame({"_tid": tid.to_numpy(), "_dn": dn.to_numpy(), "_pos": pos})
 
@@ -842,89 +874,114 @@ def _vectorized_entry_exit_elite_from_index(
         day_df = el_index.get(key)
         if day_df is None or day_df.empty or datetime_col not in day_df.columns:
             continue
+        cache_obj = day_cache.get(key) if isinstance(day_cache, dict) else None
         ppos = g["_pos"].to_numpy(dtype=np.int64)
-        dtb = pd.to_datetime(day_df[datetime_col])
-        bar_mins = dtb.dt.hour.to_numpy(dtype=np.int64) * 60 + dtb.dt.minute.to_numpy(dtype=np.int64)
+        if cache_obj is not None:
+            bar_mins_f = cache_obj["bar_mins_f"]
+            present_entry = cache_obj["present_entry"]
+            present_exit = cache_obj["present_exit"]
+            entry_num = cache_obj["entry_num"]
+            exit_num = cache_obj["exit_num"]
+        else:
+            dtb = pd.to_datetime(day_df[datetime_col], errors="coerce")
+            bar_mins = (dtb.dt.hour.to_numpy(dtype=np.int64) * 60 + dtb.dt.minute.to_numpy(dtype=np.int64)).astype(np.int64, copy=False)
+            bar_mins_f = bar_mins.astype(np.float64, copy=False)
+            present_entry = [c for c in get_entry_columns() if c in day_df.columns]
+            present_exit = [c for c in get_exit_columns() if c in day_df.columns]
+            entry_num = day_df[present_entry].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=False) if present_entry else None
+            exit_num = day_df[present_exit].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=False) if present_exit else None
         entry_mins = em[ppos]
         exit_mins = xm[ppos]
-        i_e = _pick_bar_row_indices(entry_mins, bar_mins.astype(np.float64))
-        i_x = _pick_bar_row_indices(exit_mins, bar_mins.astype(np.float64))
-        i_e_extra = {w: _pick_bar_row_indices(entry_mins, bar_mins.astype(np.float64), max_delta=int(w)) for w in extra_match_windows}
-        i_x_extra = {w: _pick_bar_row_indices(exit_mins, bar_mins.astype(np.float64), max_delta=int(w)) for w in extra_match_windows}
+        i_e = _pick_bar_row_indices(entry_mins, bar_mins_f)
+        i_x = _pick_bar_row_indices(exit_mins, bar_mins_f)
+        i_e_extra = {w: _pick_bar_row_indices(entry_mins, bar_mins_f, max_delta=int(w)) for w in extra_match_windows}
+        i_x_extra = {w: _pick_bar_row_indices(exit_mins, bar_mins_f, max_delta=int(w)) for w in extra_match_windows}
 
-        for col in get_entry_columns():
-            dest = f"{ENTRY_COLUMN_PREFIX}{col}"
-            if col not in day_df.columns:
-                continue
-            vals = np.full(len(ppos), np.nan, dtype=np.float64)
-            ok = i_e >= 0
-            if ok.any():
-                raw = day_df.iloc[i_e[ok]][col].to_numpy()
-                vn = pd.to_numeric(pd.Series(raw), errors="coerce").to_numpy(dtype=np.float64)
-                vals[ok] = np.where(np.isfinite(vn), vn, np.nan)
-            col_loc = out.columns.get_loc(dest)
-            out.iloc[ppos, col_loc] = vals
+        # Batch vectorized snapshot copy: gather from precomputed numeric arrays.
+        if present_entry and entry_num is not None:
+            ok_e = i_e >= 0
+            if ok_e.any():
+                row_idx = i_e[ok_e].astype(np.int64, copy=False)
+                gathered = entry_num[row_idx, :]
+                for c_idx, col in enumerate(present_entry):
+                    dest = f"{ENTRY_COLUMN_PREFIX}{col}"
+                    if dest not in col_locs:
+                        continue
+                    vals = np.full(len(ppos), np.nan, dtype=np.float64)
+                    vals[ok_e] = gathered[:, c_idx]
+                    out.iloc[ppos, col_locs[dest]] = vals
+        if present_exit and exit_num is not None:
+            ok_x = i_x >= 0
+            if ok_x.any():
+                row_idx = i_x[ok_x].astype(np.int64, copy=False)
+                gathered = exit_num[row_idx, :]
+                for c_idx, col in enumerate(present_exit):
+                    dest = f"{EXIT_COLUMN_PREFIX}{col}"
+                    if dest not in col_locs:
+                        continue
+                    vals = np.full(len(ppos), np.nan, dtype=np.float64)
+                    vals[ok_x] = gathered[:, c_idx]
+                    out.iloc[ppos, col_locs[dest]] = vals
 
-        for col in get_exit_columns():
-            dest = f"{EXIT_COLUMN_PREFIX}{col}"
-            if col not in day_df.columns:
-                continue
-            vals = np.full(len(ppos), np.nan, dtype=np.float64)
-            ok = i_x >= 0
-            if ok.any():
-                raw = day_df.iloc[i_x[ok]][col].to_numpy()
-                vn = pd.to_numeric(pd.Series(raw), errors="coerce").to_numpy(dtype=np.float64)
-                vals[ok] = np.where(np.isfinite(vn), vn, np.nan)
-            col_loc = out.columns.get_loc(dest)
-            out.iloc[ppos, col_loc] = vals
-
+        pending_rows: dict[str, list[int]] = {}
+        pending_vals: dict[str, list[Any]] = {}
         for j in range(len(ppos)):
             p = int(ppos[j])
             e_min, x_min = entry_mins[j], exit_mins[j]
             if not (np.isfinite(e_min) and np.isfinite(x_min) and i_e[j] >= 0 and i_x[j] >= 0):
                 continue
-            row = out.iloc[p]
-            slice_df = _slice_day_df_by_minutes(day_df, e_min, x_min, datetime_col)
-            if slice_df is None or slice_df.empty:
+            entry_price = entry_price_arr[p]
+            exit_price = exit_price_arr[p]
+            net_pnl = net_pnl_arr[p] if np.isfinite(net_pnl_arr[p]) else 0.0
+            shares_val = shares_arr[p] if np.isfinite(shares_arr[p]) else 0.0
+            side = "long" if shares_val > 0 else "short"
+            if not (np.isfinite(entry_price) and np.isfinite(exit_price)):
                 continue
-            entry_price = row.get("entry_price")
-            exit_price = row.get("exit_price")
-            net_pnl = row.get("net_pnl", 0.0)
-            side = "long" if (row.get("shares") or 0) > 0 else "short"
-            if entry_price is None or exit_price is None:
-                continue
-            tdict = out.iloc[p].to_dict()
-            _apply_elite_exit_from_slice(
-                tdict,
-                slice_df,
-                float(entry_price),
-                float(exit_price),
-                float(net_pnl),
-                side,
-            )
-            _apply_strict_path_behavior_metrics(
-                tdict,
-                day_df,
-                slice_df,
-                entry_idx=int(i_e[j]),
-                exit_idx=int(i_x[j]),
-                side=side,
-                entry_price=float(entry_price),
-            )
-            for w in extra_match_windows:
-                ok_w = bool(np.isfinite(e_min) and np.isfinite(x_min) and i_e_extra[w][j] >= 0 and i_x_extra[w][j] >= 0)
-                tdict[f"Exit_Col_PathEligible_{w}m"] = 1.0 if ok_w else 0.0
-                if not ok_w:
+            stop_price = float(stop_arr[p]) if np.isfinite(stop_arr[p]) else None
+            target_price = float(target_arr[p]) if np.isfinite(target_arr[p]) else None
+            if cache_obj is not None:
+                tdict = _compute_path_metrics_array_native(
+                    day_cache_obj=cache_obj,
+                    entry_idx=int(i_e[j]),
+                    exit_idx=int(i_x[j]),
+                    entry_min=float(e_min),
+                    exit_min=float(x_min),
+                    side=side,
+                    entry_price=float(entry_price),
+                    exit_price=float(exit_price),
+                    net_pnl=float(net_pnl),
+                    shares=float(shares_val),
+                    stop_price=stop_price,
+                    target_price=target_price,
+                )
+            else:
+                slice_df = _slice_day_df_by_minutes(day_df, e_min, x_min, datetime_col)
+                if slice_df is None or slice_df.empty:
                     continue
-                tmp_metrics: dict[str, Any] = {}
+                tdict = {"shares": float(shares_val)}
                 _apply_elite_exit_from_slice(
-                    tmp_metrics,
+                    tdict,
                     slice_df,
                     float(entry_price),
                     float(exit_price),
                     float(net_pnl),
                     side,
                 )
+                _apply_strict_path_behavior_metrics(
+                    tdict,
+                    day_df,
+                    slice_df,
+                    entry_idx=int(i_e[j]),
+                    exit_idx=int(i_x[j]),
+                    side=side,
+                    entry_price=float(entry_price),
+                )
+            for w in extra_match_windows:
+                ok_w = bool(np.isfinite(e_min) and np.isfinite(x_min) and i_e_extra[w][j] >= 0 and i_x_extra[w][j] >= 0)
+                tdict[f"Exit_Col_PathEligible_{w}m"] = 1.0 if ok_w else 0.0
+                if not ok_w:
+                    continue
+                tmp_metrics = tdict
                 for mk in extra_metric_keys:
                     tdict[f"{mk}_{w}m"] = tmp_metrics.get(mk, np.nan)
             skip_k = {entry_time_col, exit_time_col, ticker_col, dc}
@@ -933,11 +990,306 @@ def _vectorized_entry_exit_elite_from_index(
                     continue
                 if k_elite not in out.columns:
                     continue
-                loc = out.columns.get_loc(k_elite)
-                if isinstance(loc, slice):
-                    loc = loc.start
-                out.iloc[p, loc] = v_elite
+                pending_rows.setdefault(k_elite, []).append(p)
+                pending_vals.setdefault(k_elite, []).append(v_elite)
+        for k_elite, rows in pending_rows.items():
+            loc = col_locs.get(k_elite)
+            if loc is None:
+                continue
+            out.iloc[rows, loc] = pending_vals.get(k_elite, [])
 
+    return out
+
+
+def _build_day_cache_for_index(
+    el_index: dict[tuple[str, pd.Timestamp], pd.DataFrame],
+    *,
+    datetime_col: str = _EL_DATETIME_COL,
+) -> dict[tuple[str, pd.Timestamp], dict[str, Any]]:
+    """Precompute per-day structures once per chunk to reduce repeated parsing work."""
+    cache: dict[tuple[str, pd.Timestamp], dict[str, Any]] = {}
+    for key, day_df in el_index.items():
+        if day_df is None or day_df.empty or datetime_col not in day_df.columns:
+            continue
+        dtb = pd.to_datetime(day_df[datetime_col], errors="coerce")
+        bar_mins = (dtb.dt.hour.to_numpy(dtype=np.int64) * 60 + dtb.dt.minute.to_numpy(dtype=np.int64)).astype(np.int64, copy=False)
+        bar_mins_f = bar_mins.astype(np.float64, copy=False)
+        present_entry = [c for c in get_entry_columns() if c in day_df.columns]
+        present_exit = [c for c in get_exit_columns() if c in day_df.columns]
+        entry_num = day_df[present_entry].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=False) if present_entry else None
+        exit_num = day_df[present_exit].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=False) if present_exit else None
+        num_open = pd.to_numeric(day_df["Open"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "Open" in day_df.columns else (
+            pd.to_numeric(day_df["open"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "open" in day_df.columns else None
+        )
+        num_high = pd.to_numeric(day_df["High"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "High" in day_df.columns else (
+            pd.to_numeric(day_df["high"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "high" in day_df.columns else None
+        )
+        num_low = pd.to_numeric(day_df["Low"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "Low" in day_df.columns else (
+            pd.to_numeric(day_df["low"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "low" in day_df.columns else None
+        )
+        num_close = pd.to_numeric(day_df["Close"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "Close" in day_df.columns else (
+            pd.to_numeric(day_df["close"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "close" in day_df.columns else None
+        )
+        num_atr = pd.to_numeric(day_df["Col_ATR14"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "Col_ATR14" in day_df.columns else None
+        num_vwap = pd.to_numeric(day_df["Col_VWAP"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "Col_VWAP" in day_df.columns else (
+            pd.to_numeric(day_df["VWAP"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "VWAP" in day_df.columns else None
+        )
+        num_vol = pd.to_numeric(day_df["Volume"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "Volume" in day_df.columns else None
+        cache[key] = {
+            "bar_mins_f": bar_mins_f,
+            "bar_mins_i": bar_mins,
+            "present_entry": present_entry,
+            "present_exit": present_exit,
+            "entry_num": entry_num,
+            "exit_num": exit_num,
+            "num_open": num_open,
+            "num_high": num_high,
+            "num_low": num_low,
+            "num_close": num_close,
+            "num_atr": num_atr,
+            "num_vwap": num_vwap,
+            "num_vol": num_vol,
+        }
+    return cache
+
+
+def _downcast_chunk_for_spool(df: pd.DataFrame) -> pd.DataFrame:
+    """Downcast heavy float64 outputs to float32 before disk spool to reduce memory footprint."""
+    if df.empty:
+        return df
+    out = df
+    downcast_cols: list[str] = []
+    for c in out.columns:
+        if str(c) == "_orig_idx":
+            continue
+        if not pd.api.types.is_float_dtype(out[c].dtype):
+            continue
+        name = str(c)
+        if name.startswith(("Entry_Col_", "Exit_Col_", "Continuous_Col_", "Col_")):
+            downcast_cols.append(c)
+    if not downcast_cols:
+        return out
+    out = out.copy()
+    for c in downcast_cols:
+        try:
+            out[c] = out[c].astype(np.float32, copy=False)
+        except Exception:
+            continue
+    return out
+
+
+def _incremental_rehydrate_spooled_chunks(
+    chunk_files: list[Path],
+    work_dir: Path,
+) -> pd.DataFrame:
+    """
+    Incrementally merge spooled chunks in bounded windows to avoid one giant concat spike.
+    """
+    if not chunk_files:
+        return pd.DataFrame()
+    try:
+        merge_window = int(os.getenv("BT_PHASE2_FINAL_MERGE_WINDOW", "24"))
+    except Exception:
+        merge_window = 24
+    merge_window = max(1, merge_window)
+    ordered = sorted(chunk_files, key=lambda p: p.name)
+    merged_window_files: list[Path] = []
+    for i in range(0, len(ordered), merge_window):
+        block = ordered[i : i + merge_window]
+        parts = [pd.read_parquet(str(pf), engine="pyarrow") for pf in block]
+        merged = pd.concat(parts, ignore_index=True)
+        if "_orig_idx" in merged.columns:
+            merged = merged.sort_values("_orig_idx")
+        out_file = work_dir / f"merged_window_{i // merge_window:06d}.parquet"
+        merged.to_parquet(out_file, index=False, engine="pyarrow")
+        merged_window_files.append(out_file)
+        del parts
+        del merged
+    final_parts = [pd.read_parquet(str(pf), engine="pyarrow") for pf in merged_window_files]
+    final_df = pd.concat(final_parts, ignore_index=True)
+    if "_orig_idx" in final_df.columns:
+        final_df = final_df.sort_values("_orig_idx")
+    return final_df
+
+
+def _compute_path_metrics_array_native(
+    *,
+    day_cache_obj: dict[str, Any],
+    entry_idx: int,
+    exit_idx: int,
+    entry_min: float,
+    exit_min: float,
+    side: str,
+    entry_price: float,
+    exit_price: float,
+    net_pnl: float,
+    shares: float,
+    stop_price: Optional[float],
+    target_price: Optional[float],
+) -> dict[str, Any]:
+    """
+    Array-native equivalent of strict+elite path metrics for one trade.
+    Behavior is kept aligned with existing strict definitions.
+    """
+    out: dict[str, Any] = {}
+    bar_mins_i = day_cache_obj.get("bar_mins_i")
+    close_all = day_cache_obj.get("num_close")
+    open_all = day_cache_obj.get("num_open")
+    high_all = day_cache_obj.get("num_high")
+    low_all = day_cache_obj.get("num_low")
+    atr_all = day_cache_obj.get("num_atr")
+    vwap_all = day_cache_obj.get("num_vwap")
+    vol_all = day_cache_obj.get("num_vol")
+
+    if (
+        bar_mins_i is None or close_all is None or open_all is None or high_all is None or low_all is None
+        or not np.isfinite(entry_min) or not np.isfinite(exit_min)
+    ):
+        return out
+
+    side_l = str(side).lower()
+    mask = (bar_mins_i >= int(entry_min)) & (bar_mins_i <= int(exit_min))
+    if not mask.any():
+        return out
+    idxs = np.flatnonzero(mask).astype(np.int64, copy=False)
+    o = open_all[idxs]
+    h = high_all[idxs]
+    l = low_all[idxs]
+    c = close_all[idxs]
+    atrs = atr_all[idxs] if atr_all is not None else None
+    bmins = bar_mins_i[idxs]
+
+    # Elite metrics (JIT kernel) + final PL_R + exit VWAP deviation.
+    if atrs is not None and np.isfinite(entry_price):
+        side_short = bool(side_l == "short")
+        jit_metrics = _compute_elite_metrics_jit(
+            c.astype(np.float64, copy=False),
+            atrs.astype(np.float64, copy=False),
+            bmins.astype(np.int64, copy=False),
+            entry_price=float(entry_price),
+            side_short=side_short,
+        )
+        if jit_metrics is not None:
+            out["Exit_Col_MaxFavorableExcursion_R"] = float(jit_metrics["mfe_r"])
+            out["Exit_Col_MAE_R"] = float(jit_metrics["mae_r"])
+            out["Exit_Col_BarsToMFE"] = int(jit_metrics["bars_to_mfe"])
+            out["Exit_Col_BarsToMAE"] = int(jit_metrics["bars_to_mae"])
+            out["Exit_Col_MaxDrawdownFromMFE_R"] = float(jit_metrics["max_dd_from_mfe"])
+            for ui, key in enumerate(_UNREALIZED_TARGET_KEYS):
+                out[f"Exit_Col_UnrealizedPL_{key}"] = float(jit_metrics["unrealized"][ui])
+        atr_exit = float(atrs[-1]) if len(atrs) else np.nan
+        if np.isfinite(atr_exit) and atr_exit > 0:
+            entry_value = abs(float(shares) * float(entry_price))
+            if entry_value > 0:
+                risk_unit = entry_value / atr_exit
+                if risk_unit > 0:
+                    out["Exit_Col_FinalPL_R"] = float(float(net_pnl) / risk_unit)
+            vwap_exit = np.nan
+            if vwap_all is not None:
+                vwap_slice = vwap_all[idxs]
+                if len(vwap_slice):
+                    vwap_exit = float(vwap_slice[-1])
+            if not np.isfinite(vwap_exit) and vol_all is not None and len(o):
+                vv = vol_all[idxs]
+                if len(vv):
+                    typical = (o + h + l + c) / 4.0
+                    cum_v = np.nancumsum(vv)
+                    cum_pv = np.nancumsum(typical * vv)
+                    if len(cum_v) and np.isfinite(cum_v[-1]) and cum_v[-1] > 0:
+                        vwap_exit = float(cum_pv[-1] / cum_v[-1])
+            if np.isfinite(vwap_exit):
+                if side_l == "short":
+                    out["Exit_Col_ExitVWAPDeviation_ATR"] = float((vwap_exit - float(exit_price)) / atr_exit)
+                else:
+                    out["Exit_Col_ExitVWAPDeviation_ATR"] = float((float(exit_price) - vwap_exit) / atr_exit)
+
+    # Strict window metrics based on day arrays.
+    for n in (10, 20, 30, 50):
+        n_use = max(2, int(n))
+        lo_e = max(0, int(entry_idx) - n_use + 1)
+        lo_x = max(0, int(exit_idx) - n_use + 1)
+        for pref, lo_i, hi_i in (("Entry", lo_e, int(entry_idx)), ("Exit", lo_x, int(exit_idx))):
+            if hi_i < lo_i:
+                continue
+            oo = open_all[lo_i : hi_i + 1]
+            cc = close_all[lo_i : hi_i + 1]
+            hh = high_all[lo_i : hi_i + 1]
+            ll = low_all[lo_i : hi_i + 1]
+            if len(oo) == 0:
+                continue
+            red = np.where(np.isfinite(cc) & np.isfinite(oo), (cc < oo).astype(np.float64), 0.0)
+            out[f"{pref}_Col_NumberOfRedBars_Last{n}"] = float(np.nansum(red))
+            span = hh - ll
+            with np.errstate(divide="ignore", invalid="ignore"):
+                upper_q = np.where(np.isfinite(cc) & np.isfinite(ll) & np.isfinite(span) & (span != 0), ((cc - ll) / span) >= 0.75, False)
+            out[f"{pref}_Col_PercentBarsClosingInUpperQuartile_Last{n}"] = float(np.nanmean(upper_q.astype(np.float64)) * 100.0) if len(upper_q) else np.nan
+    for pref in ("Entry", "Exit"):
+        k20r = f"{pref}_Col_NumberOfRedBars_Last20"
+        k20u = f"{pref}_Col_PercentBarsClosingInUpperQuartile_Last20"
+        if k20r in out:
+            out[f"{pref}_Col_NumberOfRedBars_LastN"] = out[k20r]
+        if k20u in out:
+            out[f"{pref}_Col_PercentBarsClosingInUpperQuartile"] = out[k20u]
+
+    # Strict path behavior over in-trade slice.
+    if np.isfinite(entry_price) and stop_price is not None and np.isfinite(stop_price):
+        risk = abs(float(entry_price) - float(stop_price))
+        if risk > 0:
+            if side_l == "short":
+                touch_1r_s = l <= (float(entry_price) - risk)
+                hit_stop_s = h >= float(stop_price)
+            else:
+                touch_1r_s = h >= (float(entry_price) + risk)
+                hit_stop_s = l <= float(stop_price)
+            touch_1r = bool(np.any(touch_1r_s))
+            hit_stop = bool(np.any(hit_stop_s))
+            if touch_1r and hit_stop:
+                out["Exit_Col_DidTradeTouch1RBeforeStop"] = float(int(np.flatnonzero(touch_1r_s)[0]) <= int(np.flatnonzero(hit_stop_s)[0]))
+            else:
+                out["Exit_Col_DidTradeTouch1RBeforeStop"] = float(touch_1r and not hit_stop)
+
+    if target_price is not None and np.isfinite(target_price) and stop_price is not None and np.isfinite(stop_price):
+        if side_l == "short":
+            half_target = float(entry_price) - 0.5 * (float(entry_price) - float(target_price))
+            touched_half_s = l <= half_target
+            touched_stop_s = h >= float(stop_price)
+        else:
+            half_target = float(entry_price) + 0.5 * (float(target_price) - float(entry_price))
+            touched_half_s = h >= half_target
+            touched_stop_s = l <= float(stop_price)
+        touched_half = bool(np.any(touched_half_s))
+        touched_stop = bool(np.any(touched_stop_s))
+        if touched_half and touched_stop:
+            out["Exit_Col_DidTradeTouchHalfTargetFirst"] = float(int(np.flatnonzero(touched_half_s)[0]) < int(np.flatnonzero(touched_stop_s)[0]))
+        else:
+            out["Exit_Col_DidTradeTouchHalfTargetFirst"] = float(touched_half and not touched_stop)
+
+    if 0 <= int(entry_idx) < len(high_all):
+        sig_high = float(high_all[int(entry_idx)]) if np.isfinite(high_all[int(entry_idx)]) else None
+        sig_low = float(low_all[int(entry_idx)]) if np.isfinite(low_all[int(entry_idx)]) else None
+    else:
+        sig_high = None
+        sig_low = None
+    if sig_high is not None and side_l == "short":
+        reclaim_high = float(np.any(h[1:] >= sig_high)) if len(h) > 1 else 0.0
+        out["Exit_Col_ReclaimSignalBarHigh"] = reclaim_high
+        out["Exit_Col_ReclaimOfSignalBarHigh"] = reclaim_high
+    if sig_low is not None and side_l != "short":
+        out["Exit_Col_ReclaimSignalBarLow"] = float(np.any(l[1:] <= sig_low)) if len(l) > 1 else 0.0
+
+    if vwap_all is not None:
+        vv = vwap_all[idxs]
+        if len(vv):
+            if side_l == "short":
+                rej = np.where(np.isfinite(h) & np.isfinite(c) & np.isfinite(vv), (h >= vv) & (c < vv), False)
+            else:
+                rej = np.where(np.isfinite(l) & np.isfinite(c) & np.isfinite(vv), (l <= vv) & (c > vv), False)
+            out["Exit_Col_RejectionFromVWAPCount"] = float(np.sum(rej.astype(np.float64)))
+
+    if len(c) >= 10 and np.isfinite(c[4]) and np.isfinite(c[0]) and np.isfinite(c[-1]) and np.isfinite(c[-5]):
+        early = float(c[4] - c[0])
+        late = float(c[-1] - c[-5])
+        out["Exit_Col_TrendFlipAfterEntry"] = float(np.sign(early) != np.sign(late))
     return out
 
 
@@ -972,7 +1324,12 @@ def _load_wide_for_dates(
     path = wide_path_by_year.get(year)
     if path is None:
         path = wide_path_by_year.get(str(year))
-    lookback_days = 252
+    try:
+        lookback_days = int(os.getenv("BT_PHASE2_LOOKBACK_DAYS", "252"))
+    except Exception:
+        lookback_days = 252
+    if lookback_days < 0:
+        lookback_days = 0
     d_min = pd.Timestamp(min(dates)).normalize()
     d_max = pd.Timestamp(max(dates)).normalize()
     d_lo = (d_min - pd.Timedelta(days=lookback_days)).normalize()
@@ -981,7 +1338,7 @@ def _load_wide_for_dates(
         if data.empty or "Date" not in data.columns:
             return None
         df = data.copy()
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce", cache=False).dt.normalize()
         df = df[(df["Date"] >= d_lo) & (df["Date"] <= d_max)]
         ticker_col = "Ticker" if "Ticker" in df.columns else "ticker"
         if ticker_col in df.columns and tickers:
@@ -1018,7 +1375,7 @@ def _load_wide_for_dates(
     df = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
     if df is None or df.empty or "Date" not in df.columns:
         return None
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", cache=False).dt.normalize()
     ticker_col = "Ticker" if "Ticker" in df.columns else "ticker"
     if ticker_col in df.columns and tickers:
         df = df[df[ticker_col].astype(str).str.upper().isin({t.upper() for t in tickers})]
@@ -1820,12 +2177,14 @@ def _enrich_trades_with_long(
         )
 
     get_bars_slice = _bars_slice_from_index(el_index)
+    day_cache = _build_day_cache_for_index(el_index)
     enriched_trades_chunk = _vectorized_entry_exit_elite_from_index(
         tr_slice,
         el_index,
         ticker_col,
         entry_time_col,
         exit_time_col,
+        day_cache=day_cache,
     )
 
     if not phase2_continuous:
@@ -1959,10 +2318,6 @@ def _process_single_enrichment_chunk(
     return chunk_start, chunk_result_df
 
 
-def _process_single_enrichment_chunk_worker(args: tuple) -> tuple[int, pd.DataFrame]:
-    return _process_single_enrichment_chunk(**args)
-
-
 def enrich_trades_post_backtest(
     result: RunResult,
     cleaned_year_data: dict,
@@ -2042,7 +2397,19 @@ def enrich_trades_post_backtest(
         by_year.setdefault(y, []).append((t, d))
 
     # Process year-by-year, and within each year by date chunk (never hold full year enriched long in memory)
-    CHUNK_DAYS = 21 if load_full_columns else 50
+    try:
+        _chunk_full = int(os.getenv("BT_PHASE2_CHUNK_DAYS_FULL", "21"))
+    except Exception:
+        _chunk_full = 21
+    try:
+        _chunk_restr = int(os.getenv("BT_PHASE2_CHUNK_DAYS_RESTRICTED", "50"))
+    except Exception:
+        _chunk_restr = 50
+    if _chunk_full < 1:
+        _chunk_full = 21
+    if _chunk_restr < 1:
+        _chunk_restr = 50
+    CHUNK_DAYS = _chunk_full if load_full_columns else _chunk_restr
     _cache_dir = cache_dir if (cache_dir and isinstance(cache_dir, (str, Path)) and str(cache_dir).strip()) else None
     cache_path_obj = Path(_cache_dir).resolve() if _cache_dir else None
     if cache_path_obj is not None:
@@ -2060,9 +2427,17 @@ def enrich_trades_post_backtest(
         if (tqdm and show_progress)
         else None
     )
-    per_year_enriched: list[pd.DataFrame] = []
+    # Spool enriched chunk outputs to disk immediately to minimize peak RAM.
+    spool_root = cache_path_obj if cache_path_obj is not None else Path(tempfile.gettempdir())
+    phase2_spool_dir = Path(
+        tempfile.mkdtemp(prefix="phase2_final_spool_", dir=str(spool_root))
+    )
+    spooled_chunk_files: list[Path] = []
     col_suffix = "full" if load_full_columns else "restr"
-    phase2_continuous = _phase2_should_attach_continuous(tr)
+    # Explicit runtime switch: disable expensive Continuous_Col_* phase when not needed.
+    # Default remains enabled for backward compatibility.
+    phase2_continuous_enabled = bool(getattr(config, "phase2_enable_continuous", True))
+    phase2_continuous = phase2_continuous_enabled and _phase2_should_attach_continuous(tr)
     try:
         _tls = int(getattr(config, "timeline_step_seconds", 60))
     except (TypeError, ValueError):
@@ -2090,6 +2465,7 @@ def enrich_trades_post_backtest(
             tr_year = tr[tr["_year"] == year]
             if tr_year.empty:
                 continue
+            tr_year_dates_norm = tr_year["date"].dt.normalize()
 
             chunk_tasks: list[tuple[int, list, pd.DataFrame]] = []
             cache_file_str = str(cache_file) if cache_file is not None else None
@@ -2098,13 +2474,12 @@ def enrich_trades_post_backtest(
                 if not chunk_dates:
                     continue
                 chunk_dates_set = set(pd.Timestamp(d).normalize() for d in chunk_dates)
-                tr_chunk = tr_year[tr_year["date"].dt.normalize().isin(chunk_dates_set)]
+                tr_chunk = tr_year[tr_year_dates_norm.isin(chunk_dates_set)]
                 if tr_chunk.empty:
                     continue
                 chunk_tasks.append((chunk_start, chunk_dates, tr_chunk.copy()))
 
             cw = _safe_worker_int(chunk_workers, default=1, cap=64)
-            year_chunk_results: list[pd.DataFrame] = []
             chunk_done_units: dict[int, int] = {}
             for cs, cds, _tc in chunk_tasks:
                 cds_set = set(pd.Timestamp(d).normalize() for d in cds)
@@ -2112,98 +2487,63 @@ def enrich_trades_post_backtest(
                     1 for (_tt, dd) in ticker_dates if pd.Timestamp(dd).normalize() in cds_set
                 )
 
-            proc_workers = _safe_worker_int(
-                getattr(config, "phase2_process_workers", os.getenv("BT_PHASE2_PROCESS_WORKERS", 1)),
-                default=1,
-                cap=16,
-            )
-            can_process_chunks = (
-                proc_workers > 1
-                and len(chunk_tasks) > 1
-                and not phase2_continuous
-                and not isinstance(cleaned_year_data.get(year), pd.DataFrame)
-                and not isinstance(cleaned_year_data.get(str(year)), pd.DataFrame)
-            )
-
-            if can_process_chunks:
-                worker_args = []
-                for cs, cds, tc in chunk_tasks:
-                    worker_args.append(
-                        dict(
-                            chunk_start=cs,
-                            chunk_dates=cds,
-                            tr_chunk=tc,
-                            full_year_cached=full_year_cached,
-                            cache_file_str=cache_file_str,
-                            cache_path_obj=cache_path_obj,
-                            base_cache_key=base_cache_key,
-                            year=year,
-                            tickers=tickers,
-                            end_time=end_time,
-                            session_start=session_start,
-                            session_end=session_end,
-                            cleaned_year_data=cleaned_year_data,
-                            wide_path_by_year=wide_path_by_year,
-                            load_full_columns=load_full_columns,
-                            result=None,
-                            ticker_col=ticker_col,
-                            entry_time_col=entry_time_col,
-                            exit_time_col=exit_time_col,
-                            inner_workers=cw,
-                            phase2_continuous=False,
-                            timeline_step_seconds=timeline_step_seconds_phase2,
-                        )
-                    )
-                with ProcessPoolExecutor(max_workers=min(proc_workers, len(worker_args))) as ex:
-                    futs = [ex.submit(_process_single_enrichment_chunk_worker, wa) for wa in worker_args]
-                    for fut in as_completed(futs):
-                        cs_done, cdf = fut.result()
-                        year_chunk_results.append((int(cs_done), cdf))
-                        if pbar is not None:
-                            pbar.update(int(chunk_done_units.get(int(cs_done), 0)))
-                year_chunk_results = [cdf for _, cdf in sorted(year_chunk_results, key=lambda x: x[0])]
-            else:
-                for cs, cds, tc in chunk_tasks:
-                    _, cdf = _process_single_enrichment_chunk(
-                        cs,
-                        cds,
-                        tc,
-                        full_year_cached=full_year_cached,
-                        cache_file_str=cache_file_str,
-                        cache_path_obj=cache_path_obj,
-                        base_cache_key=base_cache_key,
-                        year=year,
-                        tickers=tickers,
-                        end_time=end_time,
-                        session_start=session_start,
-                        session_end=session_end,
-                        cleaned_year_data=cleaned_year_data,
-                        wide_path_by_year=wide_path_by_year,
-                        load_full_columns=load_full_columns,
-                        result=result,
-                        ticker_col=ticker_col,
-                        entry_time_col=entry_time_col,
-                        exit_time_col=exit_time_col,
-                        inner_workers=cw,
-                        phase2_continuous=phase2_continuous,
-                        timeline_step_seconds=timeline_step_seconds_phase2,
-                    )
-                    year_chunk_results.append(cdf)
-                    if pbar is not None:
-                        pbar.update(int(chunk_done_units.get(int(cs), 0)))
-
-            year_enriched = pd.concat(year_chunk_results, ignore_index=True) if year_chunk_results else tr_year.drop(columns=["_year"], errors="ignore")
-            if "_year" in year_enriched.columns:
-                year_enriched = year_enriched.drop(columns=["_year"], errors="ignore")
-            # _orig_idx already set per chunk; ensure it exists for un-enriched fallback
-            if "_orig_idx" not in year_enriched.columns and "_orig_idx" in tr_year.columns:
-                year_enriched["_orig_idx"] = tr_year["_orig_idx"].values
-            per_year_enriched.append(year_enriched)
+            for cs, cds, tc in chunk_tasks:
+                _, cdf = _process_single_enrichment_chunk(
+                    cs,
+                    cds,
+                    tc,
+                    full_year_cached=full_year_cached,
+                    cache_file_str=cache_file_str,
+                    cache_path_obj=cache_path_obj,
+                    base_cache_key=base_cache_key,
+                    year=year,
+                    tickers=tickers,
+                    end_time=end_time,
+                    session_start=session_start,
+                    session_end=session_end,
+                    cleaned_year_data=cleaned_year_data,
+                    wide_path_by_year=wide_path_by_year,
+                    load_full_columns=load_full_columns,
+                    result=result,
+                    ticker_col=ticker_col,
+                    entry_time_col=entry_time_col,
+                    exit_time_col=exit_time_col,
+                    inner_workers=cw,
+                    phase2_continuous=phase2_continuous,
+                    timeline_step_seconds=timeline_step_seconds_phase2,
+                )
+                if "_orig_idx" not in cdf.columns and "_orig_idx" in tc.columns:
+                    cdf = cdf.copy()
+                    cdf["_orig_idx"] = tc["_orig_idx"].values
+                cdf = _downcast_chunk_for_spool(cdf)
+                if "_orig_idx" in cdf.columns:
+                    cdf = cdf.sort_values("_orig_idx")
+                spool_file = phase2_spool_dir / f"{year}_chunk_{int(cs):06d}.parquet"
+                cdf.to_parquet(spool_file, index=False, engine="pyarrow")
+                spooled_chunk_files.append(spool_file)
+                del cdf
+                if pbar is not None:
+                    pbar.update(int(chunk_done_units.get(int(cs), 0)))
+            # If no chunk produced output for this year, preserve rows via spooled fallback.
+            if not any(str(p.name).startswith(f"{year}_chunk_") for p in spooled_chunk_files):
+                fallback_df = tr_year.drop(columns=["_year"], errors="ignore").copy()
+                if "_orig_idx" not in fallback_df.columns and "_orig_idx" in tr_year.columns:
+                    fallback_df["_orig_idx"] = tr_year["_orig_idx"].values
+                fallback_df = _downcast_chunk_for_spool(fallback_df)
+                if "_orig_idx" in fallback_df.columns:
+                    fallback_df = fallback_df.sort_values("_orig_idx")
+                spool_file = phase2_spool_dir / f"{year}_chunk_fallback.parquet"
+                fallback_df.to_parquet(spool_file, index=False, engine="pyarrow")
+                spooled_chunk_files.append(spool_file)
 
         # Reassemble in original trade order
-        if not per_year_enriched:
+        if not spooled_chunk_files:
             return result
-        enriched_trades_with_continuous = pd.concat(per_year_enriched, ignore_index=True)
+        # Rehydrate in bounded windows to avoid one large concat memory spike.
+        enriched_trades_with_continuous = _incremental_rehydrate_spooled_chunks(
+            spooled_chunk_files,
+            phase2_spool_dir,
+        )
         if "_orig_idx" in enriched_trades_with_continuous.columns:
             enriched_trades_with_continuous = enriched_trades_with_continuous.sort_values("_orig_idx").drop(columns=["_orig_idx"])
         if "gst" in enriched_trades_with_continuous.columns:
@@ -2224,6 +2564,11 @@ def enrich_trades_post_backtest(
     finally:
         if pbar is not None:
             pbar.close()
+        try:
+            if "phase2_spool_dir" in locals() and phase2_spool_dir.is_dir():
+                shutil.rmtree(phase2_spool_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def enrich_results(
