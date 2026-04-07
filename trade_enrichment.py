@@ -372,11 +372,6 @@ def _elite_metrics_equal(a: dict[str, Any], b: dict[str, Any], tol: float = 1e-1
     if au.shape != bu.shape:
         return False
     return bool(np.allclose(au, bu, rtol=0.0, atol=tol, equal_nan=True))
-    try:
-        v = float(x)
-        return v if np.isfinite(v) else None
-    except (TypeError, ValueError):
-        return None
 
 
 # Column names used on enriched_long from wide_to_long + librarycolumn (for index key consistency)
@@ -430,6 +425,10 @@ def _build_enriched_long_index(
     for (t, d), grp in grouped:
         if pd.isna(d):
             continue
+        # Keep per-day bars in chronological order so row-indexed window metrics
+        # (Entry/Exit last-N windows, path metrics) are stable and correct.
+        if datetime_col in grp.columns:
+            grp = grp.sort_values(datetime_col, kind="stable").reset_index(drop=True)
         result[(str(t), pd.Timestamp(d))] = grp
     return result
 
@@ -809,14 +808,36 @@ def _pick_bar_row_indices(target_mins: np.ndarray, bar_mins: np.ndarray, *, max_
     finite = np.isfinite(target_mins)
     if not finite.any() or len(bar_mins) == 0:
         return out
-    tv = target_mins[finite].astype(np.float64)
-    bm = bar_mins.astype(np.float64)
-    dmat = np.abs(bm[None, :] - tv[:, None])
-    has_exact = (dmat == 0).any(axis=1)
-    j_exact = (dmat == 0).argmax(axis=1)
-    j_min = dmat.argmin(axis=1)
-    mn = dmat.min(axis=1)
-    picked = np.where(has_exact, j_exact, np.where(mn <= float(max_delta), j_min, -1)).astype(np.int64, copy=False)
+    tv = target_mins[finite].astype(np.float64, copy=False)
+    bm = bar_mins.astype(np.float64, copy=False)
+
+    # Hot path: day bars are typically chronological. Use searchsorted to avoid
+    # building a dense (targets x bars) distance matrix.
+    if len(bm) <= 1 or bool(np.all(bm[1:] >= bm[:-1])):
+        n = len(bm)
+        right = np.searchsorted(bm, tv, side="left")
+        has_exact = (right < n) & (bm[np.clip(right, 0, n - 1)] == tv)
+        left = np.clip(right - 1, 0, n - 1)
+        right_c = np.clip(right, 0, n - 1)
+        dl = np.abs(tv - bm[left])
+        dr = np.abs(bm[right_c] - tv)
+        nearest = np.where(dl <= dr, left, right_c).astype(np.int64, copy=False)
+        min_d = np.where(has_exact, 0.0, np.minimum(dl, dr))
+        picked = np.where(has_exact, right, np.where(min_d <= float(max_delta), nearest, -1)).astype(
+            np.int64,
+            copy=False,
+        )
+    else:
+        # Fallback for unsorted inputs keeps original nearest-bar semantics.
+        dmat = np.abs(bm[None, :] - tv[:, None])
+        has_exact = (dmat == 0).any(axis=1)
+        j_exact = (dmat == 0).argmax(axis=1)
+        j_min = dmat.argmin(axis=1)
+        mn = dmat.min(axis=1)
+        picked = np.where(has_exact, j_exact, np.where(mn <= float(max_delta), j_min, -1)).astype(
+            np.int64,
+            copy=False,
+        )
     out[np.flatnonzero(finite)] = picked
     return out
 
@@ -845,6 +866,8 @@ def _vectorized_entry_exit_elite_from_index(
 ) -> pd.DataFrame:
     """Vectorized Entry_/Exit_ snapshots + per-row elite slice (no chronological dependency across trades)."""
     out = tr_slice.copy()
+    entry_cols_all = get_entry_columns()
+    exit_cols_all = get_exit_columns()
     extra_match_windows = (10, 15, 30)
     extra_metric_keys = (
         "Exit_Col_MaxFavorableExcursion_R",
@@ -855,11 +878,11 @@ def _vectorized_entry_exit_elite_from_index(
         "Exit_Col_FinalPL_R",
     )
     base_missing: dict[str, Any] = {}
-    for col in get_entry_columns():
+    for col in entry_cols_all:
         c = f"{ENTRY_COLUMN_PREFIX}{col}"
         if c not in out.columns:
             base_missing[c] = np.nan
-    for col in get_exit_columns():
+    for col in exit_cols_all:
         c = f"{EXIT_COLUMN_PREFIX}{col}"
         if c not in out.columns:
             base_missing[c] = np.nan
@@ -924,6 +947,8 @@ def _vectorized_entry_exit_elite_from_index(
     exit_price_s = _series_or_default("exit_price", np.nan)
     net_pnl_s = _series_or_default("net_pnl", 0.0)
     shares_s = _series_or_default("shares", 0.0)
+    gross_pnl_s = _series_or_default("gross_pnl", np.nan)
+    side_s = _series_or_default("side", None)
     initial_stop_s = _series_or_default("initial_stop", np.nan)
     stop_price_s = _series_or_default("stop_price", np.nan)
     initial_stop_legacy_s = _series_or_default("InitialStop", np.nan)
@@ -935,10 +960,13 @@ def _vectorized_entry_exit_elite_from_index(
     exit_price_arr = pd.to_numeric(exit_price_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
     net_pnl_arr = pd.to_numeric(net_pnl_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
     shares_arr = pd.to_numeric(shares_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    gross_pnl_arr = pd.to_numeric(gross_pnl_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    side_arr = side_s.astype("object").to_numpy(copy=False)
     stop_arr = pd.to_numeric(initial_stop_s.fillna(stop_price_s).fillna(initial_stop_legacy_s), errors="coerce").to_numpy(dtype=np.float64, copy=False)
     target_arr = pd.to_numeric(take_profit_s.fillna(target_price_s).fillna(take_profit_legacy_s), errors="coerce").to_numpy(dtype=np.float64, copy=False)
     pos = np.arange(len(out), dtype=np.int64)
     work_i = pd.DataFrame({"_tid": tid.to_numpy(), "_dn": dn.to_numpy(), "_pos": pos})
+    skip_k = {entry_time_col, exit_time_col, ticker_col, dc}
 
     for (_, _), g in work_i.groupby(["_tid", "_dn"], sort=False):
         tkey = str(g["_tid"].iat[0])
@@ -961,8 +989,8 @@ def _vectorized_entry_exit_elite_from_index(
             dtb = pd.to_datetime(day_df[datetime_col], errors="coerce")
             bar_mins = (dtb.dt.hour.to_numpy(dtype=np.int64) * 60 + dtb.dt.minute.to_numpy(dtype=np.int64)).astype(np.int64, copy=False)
             bar_mins_f = bar_mins.astype(np.float64, copy=False)
-            present_entry = [c for c in get_entry_columns() if c in day_df.columns]
-            present_exit = [c for c in get_exit_columns() if c in day_df.columns]
+            present_entry = [c for c in entry_cols_all if c in day_df.columns]
+            present_exit = [c for c in exit_cols_all if c in day_df.columns]
             entry_num = day_df[present_entry].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=False) if present_entry else None
             exit_num = day_df[present_exit].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=False) if present_exit else None
         entry_mins = em[ppos]
@@ -1009,8 +1037,8 @@ def _vectorized_entry_exit_elite_from_index(
             exit_price = exit_price_arr[p]
             net_pnl = net_pnl_arr[p] if np.isfinite(net_pnl_arr[p]) else 0.0
             shares_val = shares_arr[p] if np.isfinite(shares_arr[p]) else 0.0
-            gross_pnl_val = out.iloc[p].get("gross_pnl", np.nan)
-            explicit_side = out.iloc[p].get("side", None)
+            gross_pnl_val = gross_pnl_arr[p]
+            explicit_side = side_arr[p]
             side = _infer_trade_side_from_values(
                 explicit_side=explicit_side,
                 shares=shares_val,
@@ -1067,7 +1095,6 @@ def _vectorized_entry_exit_elite_from_index(
                 tmp_metrics = tdict
                 for mk in extra_metric_keys:
                     tdict[f"{mk}_{w}m"] = tmp_metrics.get(mk, np.nan)
-            skip_k = {entry_time_col, exit_time_col, ticker_col, dc}
             for k_elite, v_elite in tdict.items():
                 if k_elite in skip_k:
                     continue
@@ -1091,14 +1118,16 @@ def _build_day_cache_for_index(
 ) -> dict[tuple[str, pd.Timestamp], dict[str, Any]]:
     """Precompute per-day structures once per chunk to reduce repeated parsing work."""
     cache: dict[tuple[str, pd.Timestamp], dict[str, Any]] = {}
+    entry_cols_all = get_entry_columns()
+    exit_cols_all = get_exit_columns()
     for key, day_df in el_index.items():
         if day_df is None or day_df.empty or datetime_col not in day_df.columns:
             continue
         dtb = pd.to_datetime(day_df[datetime_col], errors="coerce")
         bar_mins = (dtb.dt.hour.to_numpy(dtype=np.int64) * 60 + dtb.dt.minute.to_numpy(dtype=np.int64)).astype(np.int64, copy=False)
         bar_mins_f = bar_mins.astype(np.float64, copy=False)
-        present_entry = [c for c in get_entry_columns() if c in day_df.columns]
-        present_exit = [c for c in get_exit_columns() if c in day_df.columns]
+        present_entry = [c for c in entry_cols_all if c in day_df.columns]
+        present_exit = [c for c in exit_cols_all if c in day_df.columns]
         entry_num = day_df[present_entry].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=False) if present_entry else None
         exit_num = day_df[present_exit].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=False) if present_exit else None
         num_open = pd.to_numeric(day_df["Open"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "Open" in day_df.columns else (
