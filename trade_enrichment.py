@@ -372,6 +372,11 @@ def _elite_metrics_equal(a: dict[str, Any], b: dict[str, Any], tol: float = 1e-1
     if au.shape != bu.shape:
         return False
     return bool(np.allclose(au, bu, rtol=0.0, atol=tol, equal_nan=True))
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else None
+    except (TypeError, ValueError):
+        return None
 
 
 # Column names used on enriched_long from wide_to_long + librarycolumn (for index key consistency)
@@ -425,8 +430,7 @@ def _build_enriched_long_index(
     for (t, d), grp in grouped:
         if pd.isna(d):
             continue
-        # Keep per-day bars in chronological order so row-indexed window metrics
-        # (Entry/Exit last-N windows, path metrics) are stable and correct.
+        # Keep per-day bars chronological for stable row-indexed window metrics.
         if datetime_col in grp.columns:
             grp = grp.sort_values(datetime_col, kind="stable").reset_index(drop=True)
         result[(str(t), pd.Timestamp(d))] = grp
@@ -811,24 +815,35 @@ def _pick_bar_row_indices(target_mins: np.ndarray, bar_mins: np.ndarray, *, max_
     tv = target_mins[finite].astype(np.float64, copy=False)
     bm = bar_mins.astype(np.float64, copy=False)
 
-    # Hot path: day bars are typically chronological. Use searchsorted to avoid
-    # building a dense (targets x bars) distance matrix.
-    if len(bm) <= 1 or bool(np.all(bm[1:] >= bm[:-1])):
+    # Hot path for sorted bars: O(n log m) lookup via searchsorted while preserving
+    # dense-reference semantics for duplicates (earliest matching index wins).
+    if len(bm) <= 1 or bool(np.all(bm[1:] > bm[:-1])):
         n = len(bm)
-        right = np.searchsorted(bm, tv, side="left")
-        has_exact = (right < n) & (bm[np.clip(right, 0, n - 1)] == tv)
-        left = np.clip(right - 1, 0, n - 1)
-        right_c = np.clip(right, 0, n - 1)
-        dl = np.abs(tv - bm[left])
-        dr = np.abs(bm[right_c] - tv)
-        nearest = np.where(dl <= dr, left, right_c).astype(np.int64, copy=False)
-        min_d = np.where(has_exact, 0.0, np.minimum(dl, dr))
-        picked = np.where(has_exact, right, np.where(min_d <= float(max_delta), nearest, -1)).astype(
-            np.int64,
-            copy=False,
-        )
+        ins = np.searchsorted(bm, tv, side="left")
+        right_raw = np.clip(ins, 0, n - 1)
+        left_raw = np.clip(ins - 1, 0, n - 1)
+
+        # Earliest index for each candidate value to match argmin/argmax-first behavior.
+        right_idx = np.searchsorted(bm, bm[right_raw], side="left").astype(np.int64, copy=False)
+        left_idx = np.searchsorted(bm, bm[left_raw], side="left").astype(np.int64, copy=False)
+
+        right_val = bm[right_raw]
+        left_val = bm[left_raw]
+        dr = np.abs(right_val - tv)
+        dl = np.abs(tv - left_val)
+
+        has_exact = (ins < n) & (right_val == tv)
+        # On ties choose the smaller (earlier) index to match dense argmin.
+        choose_left = dl <= dr
+        nearest = np.where(choose_left, left_idx, right_idx).astype(np.int64, copy=False)
+        min_d = np.where(choose_left, dl, dr)
+        picked = np.where(
+            has_exact,
+            right_idx,
+            np.where(min_d <= float(max_delta), nearest, -1),
+        ).astype(np.int64, copy=False)
     else:
-        # Fallback for unsorted inputs keeps original nearest-bar semantics.
+        # Fallback for unsorted bars preserves original dense behavior exactly.
         dmat = np.abs(bm[None, :] - tv[:, None])
         has_exact = (dmat == 0).any(axis=1)
         j_exact = (dmat == 0).argmax(axis=1)
@@ -866,8 +881,6 @@ def _vectorized_entry_exit_elite_from_index(
 ) -> pd.DataFrame:
     """Vectorized Entry_/Exit_ snapshots + per-row elite slice (no chronological dependency across trades)."""
     out = tr_slice.copy()
-    entry_cols_all = get_entry_columns()
-    exit_cols_all = get_exit_columns()
     extra_match_windows = (10, 15, 30)
     extra_metric_keys = (
         "Exit_Col_MaxFavorableExcursion_R",
@@ -878,11 +891,11 @@ def _vectorized_entry_exit_elite_from_index(
         "Exit_Col_FinalPL_R",
     )
     base_missing: dict[str, Any] = {}
-    for col in entry_cols_all:
+    for col in get_entry_columns():
         c = f"{ENTRY_COLUMN_PREFIX}{col}"
         if c not in out.columns:
             base_missing[c] = np.nan
-    for col in exit_cols_all:
+    for col in get_exit_columns():
         c = f"{EXIT_COLUMN_PREFIX}{col}"
         if c not in out.columns:
             base_missing[c] = np.nan
@@ -947,8 +960,6 @@ def _vectorized_entry_exit_elite_from_index(
     exit_price_s = _series_or_default("exit_price", np.nan)
     net_pnl_s = _series_or_default("net_pnl", 0.0)
     shares_s = _series_or_default("shares", 0.0)
-    gross_pnl_s = _series_or_default("gross_pnl", np.nan)
-    side_s = _series_or_default("side", None)
     initial_stop_s = _series_or_default("initial_stop", np.nan)
     stop_price_s = _series_or_default("stop_price", np.nan)
     initial_stop_legacy_s = _series_or_default("InitialStop", np.nan)
@@ -960,13 +971,10 @@ def _vectorized_entry_exit_elite_from_index(
     exit_price_arr = pd.to_numeric(exit_price_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
     net_pnl_arr = pd.to_numeric(net_pnl_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
     shares_arr = pd.to_numeric(shares_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
-    gross_pnl_arr = pd.to_numeric(gross_pnl_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
-    side_arr = side_s.astype("object").to_numpy(copy=False)
     stop_arr = pd.to_numeric(initial_stop_s.fillna(stop_price_s).fillna(initial_stop_legacy_s), errors="coerce").to_numpy(dtype=np.float64, copy=False)
     target_arr = pd.to_numeric(take_profit_s.fillna(target_price_s).fillna(take_profit_legacy_s), errors="coerce").to_numpy(dtype=np.float64, copy=False)
     pos = np.arange(len(out), dtype=np.int64)
     work_i = pd.DataFrame({"_tid": tid.to_numpy(), "_dn": dn.to_numpy(), "_pos": pos})
-    skip_k = {entry_time_col, exit_time_col, ticker_col, dc}
 
     for (_, _), g in work_i.groupby(["_tid", "_dn"], sort=False):
         tkey = str(g["_tid"].iat[0])
@@ -989,8 +997,8 @@ def _vectorized_entry_exit_elite_from_index(
             dtb = pd.to_datetime(day_df[datetime_col], errors="coerce")
             bar_mins = (dtb.dt.hour.to_numpy(dtype=np.int64) * 60 + dtb.dt.minute.to_numpy(dtype=np.int64)).astype(np.int64, copy=False)
             bar_mins_f = bar_mins.astype(np.float64, copy=False)
-            present_entry = [c for c in entry_cols_all if c in day_df.columns]
-            present_exit = [c for c in exit_cols_all if c in day_df.columns]
+            present_entry = [c for c in get_entry_columns() if c in day_df.columns]
+            present_exit = [c for c in get_exit_columns() if c in day_df.columns]
             entry_num = day_df[present_entry].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=False) if present_entry else None
             exit_num = day_df[present_exit].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=False) if present_exit else None
         entry_mins = em[ppos]
@@ -1037,8 +1045,8 @@ def _vectorized_entry_exit_elite_from_index(
             exit_price = exit_price_arr[p]
             net_pnl = net_pnl_arr[p] if np.isfinite(net_pnl_arr[p]) else 0.0
             shares_val = shares_arr[p] if np.isfinite(shares_arr[p]) else 0.0
-            gross_pnl_val = gross_pnl_arr[p]
-            explicit_side = side_arr[p]
+            gross_pnl_val = out.iloc[p].get("gross_pnl", np.nan)
+            explicit_side = out.iloc[p].get("side", None)
             side = _infer_trade_side_from_values(
                 explicit_side=explicit_side,
                 shares=shares_val,
@@ -1095,6 +1103,7 @@ def _vectorized_entry_exit_elite_from_index(
                 tmp_metrics = tdict
                 for mk in extra_metric_keys:
                     tdict[f"{mk}_{w}m"] = tmp_metrics.get(mk, np.nan)
+            skip_k = {entry_time_col, exit_time_col, ticker_col, dc}
             for k_elite, v_elite in tdict.items():
                 if k_elite in skip_k:
                     continue
@@ -1118,16 +1127,14 @@ def _build_day_cache_for_index(
 ) -> dict[tuple[str, pd.Timestamp], dict[str, Any]]:
     """Precompute per-day structures once per chunk to reduce repeated parsing work."""
     cache: dict[tuple[str, pd.Timestamp], dict[str, Any]] = {}
-    entry_cols_all = get_entry_columns()
-    exit_cols_all = get_exit_columns()
     for key, day_df in el_index.items():
         if day_df is None or day_df.empty or datetime_col not in day_df.columns:
             continue
         dtb = pd.to_datetime(day_df[datetime_col], errors="coerce")
         bar_mins = (dtb.dt.hour.to_numpy(dtype=np.int64) * 60 + dtb.dt.minute.to_numpy(dtype=np.int64)).astype(np.int64, copy=False)
         bar_mins_f = bar_mins.astype(np.float64, copy=False)
-        present_entry = [c for c in entry_cols_all if c in day_df.columns]
-        present_exit = [c for c in exit_cols_all if c in day_df.columns]
+        present_entry = [c for c in get_entry_columns() if c in day_df.columns]
+        present_exit = [c for c in get_exit_columns() if c in day_df.columns]
         entry_num = day_df[present_entry].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=False) if present_entry else None
         exit_num = day_df[present_exit].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=False) if present_exit else None
         num_open = pd.to_numeric(day_df["Open"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "Open" in day_df.columns else (
@@ -2222,14 +2229,37 @@ def _run_phase2_continuous_tracking(
 ) -> pd.DataFrame:
     """Concatenate entry–exit bar paths per sub-chunk of trades, then attach_continuous_tracking."""
     _ts = max(1, int(timeline_step_seconds))
+    parity_check = _env_bool("BT_PHASE2_PARITY_CHECK", default=False)
     chunk_trades_list: list[pd.DataFrame] = []
     n_trades = len(tr_slice)
-    for start in range(0, n_trades, _CONTINUOUS_TRACKING_CHUNK_SIZE):
-        end = min(start + _CONTINUOUS_TRACKING_CHUNK_SIZE, n_trades)
-        tr_cc = tr_slice.iloc[start:end]
-        trades_cc = enriched_trades_chunk.iloc[start:end]
-        slices_cc: list[pd.DataFrame] = []
-        for _, row in tr_cc.iterrows():
+
+    def _minute_to_time(m: int) -> time:
+        m = int(m)
+        return time(m // 60, m % 60)
+
+    def _attach_with_el(trades_part: pd.DataFrame, el_part: pd.DataFrame) -> pd.DataFrame:
+        if el_part.empty:
+            return trades_part
+        cr = attach_continuous_tracking(
+            RunResult(
+                final_balance=result.final_balance,
+                total_return_pct=result.total_return_pct,
+                total_trades=result.total_trades,
+                winning_trades=result.winning_trades,
+                losing_trades=result.losing_trades,
+                total_pnl=result.total_pnl,
+                trades=trades_part,
+                daily_equity=result.daily_equity,
+                analyzers=result.analyzers,
+            ),
+            el_part,
+            timeline_step_seconds=_ts,
+        )
+        return cr.trades
+
+    def _build_el_cc_rowwise(tr_cc_local: pd.DataFrame) -> pd.DataFrame:
+        slices_local: list[pd.DataFrame] = []
+        for _, row in tr_cc_local.iterrows():
             ticker = str(row.get(ticker_col, row.get("ticker", ""))).strip()
             date_val = row.get("date", row.get("Date"))
             if pd.isna(date_val):
@@ -2241,28 +2271,91 @@ def _run_phase2_continuous_tracking(
                 continue
             sl = get_bars_slice(ticker, date_ts, entry_t, exit_t)
             if sl is not None and not sl.empty:
-                slices_cc.append(sl)
+                slices_local.append(sl)
+        out = pd.concat(slices_local, ignore_index=True) if slices_local else pd.DataFrame()
+        return _ensure_naive_datetime_column(out)
+
+    for start in range(0, n_trades, _CONTINUOUS_TRACKING_CHUNK_SIZE):
+        end = min(start + _CONTINUOUS_TRACKING_CHUNK_SIZE, n_trades)
+        tr_cc = tr_slice.iloc[start:end]
+        trades_cc = enriched_trades_chunk.iloc[start:end]
+        slices_cc: list[pd.DataFrame] = []
+
+        ticker_src = ticker_col if ticker_col in tr_cc.columns else ("ticker" if "ticker" in tr_cc.columns else None)
+        date_src = "date" if "date" in tr_cc.columns else ("Date" if "Date" in tr_cc.columns else None)
+        entry_src = entry_time_col if entry_time_col in tr_cc.columns else ("entry_time" if "entry_time" in tr_cc.columns else None)
+        exit_src = exit_time_col if exit_time_col in tr_cc.columns else ("exit_time" if "exit_time" in tr_cc.columns else None)
+
+        if ticker_src and date_src and entry_src and exit_src:
+            meta = pd.DataFrame(index=tr_cc.index)
+            meta["_ticker"] = tr_cc[ticker_src].astype(str).str.strip().str.upper()
+            meta["_date"] = pd.to_datetime(tr_cc[date_src], errors="coerce").map(_calendar_date_key)
+            meta["_entry_min"] = tr_cc[entry_src].map(_time_to_minutes_optional)
+            meta["_exit_min"] = tr_cc[exit_src].map(_time_to_minutes_optional)
+            valid = (
+                meta["_ticker"].ne("")
+                & meta["_date"].notna()
+                & np.isfinite(meta["_entry_min"].to_numpy(dtype=np.float64, copy=False))
+                & np.isfinite(meta["_exit_min"].to_numpy(dtype=np.float64, copy=False))
+            )
+            if valid.any():
+                mvalid = meta.loc[valid, ["_ticker", "_date", "_entry_min", "_exit_min"]].copy()
+                for (tkr, dts), grp in mvalid.groupby(["_ticker", "_date"], sort=False):
+                    e_arr = grp["_entry_min"].to_numpy(dtype=np.int64, copy=False)
+                    x_arr = grp["_exit_min"].to_numpy(dtype=np.int64, copy=False)
+                    if e_arr.size == 0:
+                        continue
+                    lo_min = int(np.min(e_arr))
+                    hi_min = int(np.max(x_arr))
+                    if hi_min < lo_min:
+                        continue
+                    day_slice = get_bars_slice(
+                        str(tkr),
+                        pd.Timestamp(dts),
+                        _minute_to_time(lo_min),
+                        _minute_to_time(hi_min),
+                    )
+                    if day_slice is None or day_slice.empty or "datetime" not in day_slice.columns:
+                        continue
+                    day_dt = pd.to_datetime(day_slice["datetime"], errors="coerce")
+                    bar_mins = (
+                        day_dt.dt.hour.to_numpy(dtype=np.int64, copy=False) * 60
+                        + day_dt.dt.minute.to_numpy(dtype=np.int64, copy=False)
+                    )
+                    if bar_mins.size == 0:
+                        continue
+                    # day_slice is sorted by datetime from get_bars_slice; use binary bounds per trade.
+                    left = np.searchsorted(bar_mins, e_arr, side="left")
+                    right = np.searchsorted(bar_mins, x_arr, side="right")
+                    for l_i, r_i in zip(left, right):
+                        if int(r_i) <= int(l_i):
+                            continue
+                        sl = day_slice.iloc[int(l_i) : int(r_i)]
+                        if not sl.empty:
+                            slices_cc.append(sl)
+
         el_cc = pd.concat(slices_cc, ignore_index=True) if slices_cc else pd.DataFrame()
         el_cc = _ensure_naive_datetime_column(el_cc)
-        if not el_cc.empty:
-            cr = attach_continuous_tracking(
-                RunResult(
-                    final_balance=result.final_balance,
-                    total_return_pct=result.total_return_pct,
-                    total_trades=result.total_trades,
-                    winning_trades=result.winning_trades,
-                    losing_trades=result.losing_trades,
-                    total_pnl=result.total_pnl,
-                    trades=trades_cc,
-                    daily_equity=result.daily_equity,
-                    analyzers=result.analyzers,
-                ),
-                el_cc,
-                timeline_step_seconds=_ts,
-            )
-            chunk_trades_list.append(cr.trades)
-        else:
-            chunk_trades_list.append(trades_cc)
+        fast_trades = _attach_with_el(trades_cc, el_cc)
+
+        if parity_check:
+            legacy_el_cc = _build_el_cc_rowwise(tr_cc)
+            legacy_trades = _attach_with_el(trades_cc, legacy_el_cc)
+            try:
+                pd.testing.assert_frame_equal(
+                    fast_trades.reset_index(drop=True),
+                    legacy_trades.reset_index(drop=True),
+                    check_dtype=False,
+                    check_like=False,
+                    rtol=1e-12,
+                    atol=1e-12,
+                )
+            except AssertionError as exc:
+                raise RuntimeError(
+                    f"BT_PHASE2_PARITY_CHECK mismatch in continuous tracking chunk [{start}:{end}]."
+                ) from exc
+
+        chunk_trades_list.append(fast_trades)
     return pd.concat(chunk_trades_list, ignore_index=True) if chunk_trades_list else enriched_trades_chunk
 
 
