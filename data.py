@@ -1141,4 +1141,3 @@ def resolve_split_session_cache_paths(
                 by_session[sess][ys] = p_flat_legacy.resolve()
 
     return by_session
-

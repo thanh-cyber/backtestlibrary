@@ -1031,4 +1031,3 @@ class ChronologicalBacktestEngine:
         trade.Exit_Col_UnrealizedPL_1530 = float(pos.unrealized_pl_1530)
         trade.Exit_Col_UnrealizedPL_1600 = float(pos.unrealized_pl_1600)
         return net_pnl, trade
-

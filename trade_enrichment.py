@@ -697,6 +697,47 @@ def _apply_strict_path_behavior_metrics(
             tdict["Exit_Col_TrendFlipAfterEntry"] = float(np.sign(early) != np.sign(late))
 
 
+def _infer_trade_side(trade: dict[str, Any]) -> str:
+    """Infer long/short side from trade fields.
+
+    Priority:
+    1) explicit `side` when present;
+    2) gross PnL consistency with long vs short formulas;
+    3) conservative fallback to long.
+    """
+    explicit = trade.get("side")
+    if explicit is not None and str(explicit).strip().lower() in {"long", "short"}:
+        return str(explicit).strip().lower()
+
+    shares = _to_float(trade.get("shares"))
+    entry_price = _to_float(trade.get("entry_price"))
+    exit_price = _to_float(trade.get("exit_price"))
+    gross_pnl = _to_float(trade.get("gross_pnl"))
+    if (
+        shares is not None
+        and shares > 0
+        and entry_price is not None
+        and exit_price is not None
+        and gross_pnl is not None
+    ):
+        long_pnl = shares * (exit_price - entry_price)
+        short_pnl = shares * (entry_price - exit_price)
+        # Tolerate tiny numeric/fee-related noise around near-flat outcomes.
+        # If both formulas are effectively tied, use raw price direction.
+        tol = max(1e-9, abs(shares) * 1e-6)
+        d_short = abs(gross_pnl - short_pnl)
+        d_long = abs(gross_pnl - long_pnl)
+        if abs(d_short - d_long) <= tol:
+            if exit_price < entry_price:
+                return "short"
+            if exit_price > entry_price:
+                return "long"
+            return "long"
+        if d_short < d_long:
+            return "short"
+    return "long"
+
+
 def _enrich_long_per_ticker_date(long_df: pd.DataFrame) -> pd.DataFrame:
     """
     Run librarycolumn enrichment per (Ticker, Date) group, since add_all_columns
