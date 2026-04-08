@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import io
+import gc
 import os
 import re
 import shutil
 import tempfile
 import warnings
 from contextlib import redirect_stderr, redirect_stdout
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
@@ -65,6 +66,154 @@ def _enrich_long_quiet(long_df: pd.DataFrame) -> pd.DataFrame:
         warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             return enrich_long_with_library_columns(long_df)
+
+
+def _env_int_strict(name: str, default: int, *, min_value: int = 1) -> int:
+    """Parse integer env var and fail loud on invalid values."""
+    raw = os.getenv(name)
+    if raw is None:
+        v = int(default)
+    else:
+        try:
+            v = int(str(raw).strip())
+        except Exception as exc:
+            raise RuntimeError(f"{name} must be an integer, got {raw!r}.") from exc
+    if v < min_value:
+        raise RuntimeError(f"{name} must be >= {min_value}, got {v}.")
+    return v
+
+
+def _prepare_long_for_enrichment(long_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize datetime once and cache bar-minute integers.
+    Raises on invalid/missing datetime because Phase 2 requires it.
+    """
+    if long_df is None or long_df.empty:
+        return long_df
+    if "datetime" not in long_df.columns:
+        raise RuntimeError("Phase 2 enrichment requires a 'datetime' column in long_df.")
+    out = long_df.copy()
+    dt = pd.to_datetime(out["datetime"], errors="coerce")
+    if dt.isna().any():
+        bad = int(dt.isna().sum())
+        raise RuntimeError(f"Phase 2 datetime normalization found {bad} invalid datetime values.")
+    if getattr(dt.dt, "tz", None) is not None:
+        dt = dt.dt.tz_localize(None)
+    out["datetime"] = dt
+    out["_dt_bar_min"] = (dt.dt.hour.to_numpy(dtype=np.int64) * 60 + dt.dt.minute.to_numpy(dtype=np.int64))
+    return out
+
+
+def _enrich_long_quiet_worker(batch_df: pd.DataFrame) -> pd.DataFrame:
+    """Process-pool worker for one ticker batch."""
+    if not isinstance(batch_df, pd.DataFrame):
+        raise TypeError(f"Expected DataFrame batch, got {type(batch_df)!r}")
+    return _enrich_long_quiet(batch_df)
+
+
+def _enrich_long_chunked_by_ticker(
+    long_df: pd.DataFrame,
+    *,
+    ticker_col: str = "Ticker",
+) -> pd.DataFrame:
+    """
+    Full-column enrichment in ticker batches to lower peak memory.
+
+    This keeps output semantics (same enrichment function) while avoiding one
+    giant `add_full_enrichment(df)` call on the entire chunk.
+    """
+    if long_df is None or long_df.empty:
+        return pd.DataFrame()
+    if ticker_col not in long_df.columns:
+        return _enrich_long_quiet(long_df)
+
+    batch_tickers = _env_int_strict("BT_PHASE2_ENRICH_TICKER_BATCH", 25, min_value=1)
+    batch_workers = _env_int_strict("BT_PHASE2_ENRICH_BATCH_WORKERS", 1, min_value=1)
+    max_inflight_rows = _env_int_strict("BT_PHASE2_ENRICH_MAX_INFLIGHT_ROWS", 1_200_000, min_value=1)
+    max_inflight_batches = _env_int_strict(
+        "BT_PHASE2_ENRICH_MAX_INFLIGHT_BATCHES",
+        max(1, batch_workers),
+        min_value=1,
+    )
+
+    tser = long_df[ticker_col].astype(str).str.strip()
+    tickers = [t for t in tser.dropna().drop_duplicates().tolist() if t]
+    if not tickers:
+        return _enrich_long_quiet(long_df)
+
+    # Cache row-index membership once (avoid repeated full-frame isin scans).
+    row_pos = pd.Series(np.arange(len(long_df), dtype=np.int64), index=long_df.index)
+    group_pos = row_pos.groupby(tser, sort=False).groups
+    idx_map: dict[str, np.ndarray] = {}
+    for t in tickers:
+        gp = group_pos.get(t)
+        if gp is None:
+            continue
+        idx_map[t] = np.asarray(gp, dtype=np.int64)
+
+    batch_indices: list[np.ndarray] = []
+    for i in range(0, len(tickers), batch_tickers):
+        bt = tickers[i : i + batch_tickers]
+        idx_parts = [idx_map[t] for t in bt if t in idx_map]
+        if not idx_parts:
+            continue
+        idx = np.concatenate(idx_parts).astype(np.int64, copy=False)
+        idx.sort()
+        batch_indices.append(idx)
+
+    if not batch_indices:
+        return pd.DataFrame()
+
+    parts: list[pd.DataFrame] = []
+    if batch_workers <= 1:
+        for idx in batch_indices:
+            sub = long_df.iloc[idx].copy()
+            enriched_sub = _enrich_long_quiet(sub)
+            del sub
+            if enriched_sub is not None and not enriched_sub.empty:
+                parts.append(enriched_sub)
+            gc.collect()
+    else:
+        pending: list[tuple[Any, int]] = []
+        next_batch = 0
+        inflight_rows = 0
+        with ProcessPoolExecutor(max_workers=batch_workers) as ex:
+            while next_batch < len(batch_indices) or pending:
+                submitted_any = False
+                while next_batch < len(batch_indices) and len(pending) < max_inflight_batches:
+                    idx = batch_indices[next_batch]
+                    rows_n = int(len(idx))
+                    # Respect row-based memory cap; always allow at least one in-flight batch.
+                    if pending and (inflight_rows + rows_n) > max_inflight_rows:
+                        break
+                    sub = long_df.iloc[idx].copy()
+                    fut = ex.submit(_enrich_long_quiet_worker, sub)
+                    del sub
+                    pending.append((fut, rows_n))
+                    inflight_rows += rows_n
+                    next_batch += 1
+                    submitted_any = True
+                if not pending:
+                    raise RuntimeError("No in-flight batch while batches remain; invalid inflight scheduling state.")
+
+                done_future = next(as_completed([f for f, _ in pending]))
+                done_i = next(i for i, (f, _) in enumerate(pending) if f is done_future)
+                _, done_rows = pending.pop(done_i)
+                inflight_rows -= done_rows
+                enriched_sub = done_future.result()
+                if enriched_sub is not None and not enriched_sub.empty:
+                    parts.append(enriched_sub)
+                gc.collect()
+
+                # If nothing could be submitted because of row cap, loop continues after one completion.
+                if not submitted_any and next_batch < len(batch_indices) and inflight_rows < 0:
+                    raise RuntimeError("In-flight row accounting went negative.")
+
+    if not parts:
+        return pd.DataFrame()
+    if len(parts) == 1:
+        return parts[0]
+    return pd.concat(parts, ignore_index=True)
 
 
 def _enrichment_cache_dates_tickers_id(dates: list, tickers: set) -> str:
@@ -1510,10 +1659,13 @@ def _filter_long_to_session(
     """Filter long DataFrame to bars from session_start through session_end_time."""
     if long_df.empty or datetime_col not in long_df.columns:
         return long_df
-    dt = pd.to_datetime(long_df[datetime_col])
     start_minutes = session_start.hour * 60 + session_start.minute
     end_minutes = session_end_time.hour * 60 + session_end_time.minute
-    bar_minutes = dt.dt.hour * 60 + dt.dt.minute
+    if "_dt_bar_min" in long_df.columns:
+        bar_minutes = pd.to_numeric(long_df["_dt_bar_min"], errors="coerce")
+    else:
+        dt = pd.to_datetime(long_df[datetime_col], errors="coerce")
+        bar_minutes = dt.dt.hour * 60 + dt.dt.minute
     mask = (bar_minutes >= start_minutes) & (bar_minutes <= end_minutes)
     return long_df.loc[mask].copy()
 
@@ -1579,14 +1731,15 @@ def _build_enriched_long_for_chunk(
     rename_map = {c: c.capitalize() for c in ["open", "high", "low", "close", "volume"] if c in long_df.columns}
     if rename_map:
         long_df = long_df.rename(columns=rename_map)
+    long_df = _prepare_long_for_enrichment(long_df)
     long_df = _filter_long_to_session(long_df, session_start, end_time)
     if long_df.empty:
         return None
-    if "datetime" in long_df.columns:
-        long_df = long_df.copy()
-        dt = pd.to_datetime(long_df["datetime"])
-        long_df["datetime"] = dt.dt.tz_localize(None) if dt.dt.tz is not None else dt
-    enriched = _enrich_long_quiet(long_df)
+    long_df = long_df.drop(columns=["_dt_bar_min"], errors="ignore")
+    if load_full_columns:
+        enriched = _enrich_long_chunked_by_ticker(long_df)
+    else:
+        enriched = _enrich_long_quiet(long_df)
     del long_df
     if enriched.empty:
         return None
@@ -1640,15 +1793,15 @@ def _build_enriched_long_for_year(args: tuple) -> tuple[str, list[pd.DataFrame]]
         rename_map = {c: c.capitalize() for c in ["open", "high", "low", "close", "volume"] if c in long_df.columns}
         if rename_map:
             long_df = long_df.rename(columns=rename_map)
+        long_df = _prepare_long_for_enrichment(long_df)
         long_df = _filter_long_to_session(long_df, session_start, end_time)
         if long_df.empty:
             continue
-        # Force datetime to tz-naive so librarycolumn never sees tz-naive vs tz-aware comparison
-        if "datetime" in long_df.columns:
-            long_df = long_df.copy()
-            dt = pd.to_datetime(long_df["datetime"])
-            long_df["datetime"] = dt.dt.tz_localize(None) if dt.dt.tz is not None else dt
-        enriched = _enrich_long_quiet(long_df)
+        long_df = long_df.drop(columns=["_dt_bar_min"], errors="ignore")
+        if load_full_columns:
+            enriched = _enrich_long_chunked_by_ticker(long_df)
+        else:
+            enriched = _enrich_long_quiet(long_df)
         del long_df
         if not enriched.empty:
             year_parts.append(enriched)
