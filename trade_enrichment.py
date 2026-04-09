@@ -129,6 +129,15 @@ def _enrich_long_chunked_by_ticker(
         return _enrich_long_quiet(long_df)
 
     batch_tickers = _env_int_strict("BT_PHASE2_ENRICH_TICKER_BATCH", 25, min_value=1)
+    target_rows_per_batch = _env_int_strict(
+        "BT_PHASE2_ENRICH_TARGET_ROWS_PER_BATCH",
+        250_000,
+        min_value=1,
+    )
+    force_slice_copy = _env_bool("BT_PHASE2_ENRICH_FORCE_SLICE_COPY", default=False)
+    executor_mode = str(os.getenv("BT_PHASE2_ENRICH_EXECUTOR", "process")).strip().lower()
+    if executor_mode not in {"process", "thread"}:
+        raise RuntimeError("BT_PHASE2_ENRICH_EXECUTOR must be 'process' or 'thread'.")
     batch_workers = _env_int_strict("BT_PHASE2_ENRICH_BATCH_WORKERS", 1, min_value=1)
     max_inflight_rows = _env_int_strict("BT_PHASE2_ENRICH_MAX_INFLIGHT_ROWS", 1_200_000, min_value=1)
     max_inflight_batches = _env_int_strict(
@@ -142,31 +151,43 @@ def _enrich_long_chunked_by_ticker(
     # is not a 0..N-1 RangeIndex.
     tser = long_df[ticker_col].astype("string").str.strip()
     valid_ticker = tser.notna() & (tser != "")
-    tickers = [str(t) for t in tser[valid_ticker].drop_duplicates().tolist()]
-    if not tickers:
+    valid_mask = valid_ticker.to_numpy(dtype=bool)
+    tarr = tser.to_numpy(dtype=object, na_value=None)
+    valid_pos = np.flatnonzero(valid_mask)
+    if len(valid_pos) == 0:
         return _enrich_long_quiet(long_df)
 
-    # Cache positional membership once (avoid repeated full-frame scans).
-    idx_lists: dict[str, list[int]] = {}
-    for pos, t in enumerate(tser.to_numpy(dtype=object, na_value=None)):
-        if t is None or t == "":
-            continue
-        ts = str(t)
-        idx_lists.setdefault(ts, []).append(pos)
-
-    idx_map: dict[str, np.ndarray] = {
-        t: np.asarray(pos_list, dtype=np.int64)
-        for t, pos_list in idx_lists.items()
-        if pos_list
-    }
+    # Cache positional membership once (avoid repeated full-frame scans)
+    # while guaranteeing iloc-safe integer positions even when long_df has
+    # non-RangeIndex labels.
+    valid_vals = tarr[valid_pos]
+    codes, _ = pd.factorize(valid_vals, sort=False)
+    order = np.argsort(codes, kind="stable")
+    sorted_codes = codes[order]
+    sorted_pos = valid_pos[order]
+    split_at = np.flatnonzero(np.diff(sorted_codes)) + 1
+    grouped_pos = np.split(sorted_pos, split_at) if len(sorted_pos) else []
+    grouped_pos = [
+        np.asarray(pos_arr, dtype=np.int64, copy=False)
+        for pos_arr in grouped_pos
+        if len(pos_arr) > 0
+    ]
 
     batch_indices: list[np.ndarray] = []
-    for i in range(0, len(tickers), batch_tickers):
-        bt = tickers[i : i + batch_tickers]
-        idx_parts = [idx_map[t] for t in bt if t in idx_map]
-        if not idx_parts:
+    cur_parts: list[np.ndarray] = []
+    cur_rows = 0
+    for pos_arr in grouped_pos:
+        cur_parts.append(pos_arr)
+        cur_rows += int(len(pos_arr))
+        if len(cur_parts) < batch_tickers and cur_rows < target_rows_per_batch:
             continue
-        idx = np.concatenate(idx_parts).astype(np.int64, copy=False)
+        idx = np.concatenate(cur_parts).astype(np.int64, copy=False)
+        idx.sort()
+        batch_indices.append(idx)
+        cur_parts = []
+        cur_rows = 0
+    if cur_parts:
+        idx = np.concatenate(cur_parts).astype(np.int64, copy=False)
         idx.sort()
         batch_indices.append(idx)
 
@@ -176,7 +197,9 @@ def _enrich_long_chunked_by_ticker(
     parts: list[pd.DataFrame] = []
     if batch_workers <= 1:
         for idx in batch_indices:
-            sub = long_df.iloc[idx].copy()
+            sub = long_df.iloc[idx]
+            if force_slice_copy:
+                sub = sub.copy()
             enriched_sub = _enrich_long_quiet(sub)
             del sub
             if enriched_sub is not None and not enriched_sub.empty:
@@ -186,7 +209,9 @@ def _enrich_long_chunked_by_ticker(
         pending: list[tuple[Any, int]] = []
         next_batch = 0
         inflight_rows = 0
-        with ProcessPoolExecutor(max_workers=batch_workers) as ex:
+        ex_cls = ThreadPoolExecutor if executor_mode == "thread" else ProcessPoolExecutor
+        submit_fn = _enrich_long_quiet if executor_mode == "thread" else _enrich_long_quiet_worker
+        with ex_cls(max_workers=batch_workers) as ex:
             while next_batch < len(batch_indices) or pending:
                 submitted_any = False
                 while next_batch < len(batch_indices) and len(pending) < max_inflight_batches:
@@ -195,8 +220,10 @@ def _enrich_long_chunked_by_ticker(
                     # Respect row-based memory cap; always allow at least one in-flight batch.
                     if pending and (inflight_rows + rows_n) > max_inflight_rows:
                         break
-                    sub = long_df.iloc[idx].copy()
-                    fut = ex.submit(_enrich_long_quiet_worker, sub)
+                    sub = long_df.iloc[idx]
+                    if force_slice_copy:
+                        sub = sub.copy()
+                    fut = ex.submit(submit_fn, sub)
                     del sub
                     pending.append((fut, rows_n))
                     inflight_rows += rows_n
@@ -2906,28 +2933,41 @@ def enrich_trades_post_backtest(
         return result
     tr["date"] = pd.to_datetime(tr[date_col], errors="coerce").dt.normalize()
 
-    # Collect unique (year, ticker, date) and max exit_time per (ticker, date)
-    year_from_date = tr["date"].dt.year.astype(str)
-    tr["_year"] = year_from_date
-    unique_keys: list[tuple[str, str, pd.Timestamp]] = []
-    seen = set()
-    max_exit_by_key: dict[tuple[str, pd.Timestamp], time] = {}
-    for _, row in tr.iterrows():
-        y = str(row["_year"])
-        t = str(row[ticker_col]).strip()
-        d = row["date"]
-        if pd.isna(d):
-            continue
-        key = (y, t, d)
-        if key not in seen:
-            seen.add(key)
-            unique_keys.append(key)
-        exit_t = _parse_time_str(row.get(exit_time_col))
-        if exit_t is not None:
-            k = (t, d)
-            cur = max_exit_by_key.get(k)
-            if cur is None or (exit_t.hour * 60 + exit_t.minute) > (cur.hour * 60 + cur.minute):
-                max_exit_by_key[k] = exit_t
+    # Collect unique (year, ticker, date) and max exit_time per (ticker, date).
+    # Vectorized path keeps first-seen order for unique_keys and avoids row-wise iterrows().
+    tr["_year"] = tr["date"].dt.year.astype(str)
+    ticker_norm = tr[ticker_col].astype(str).str.strip()
+    valid_date = tr["date"].notna()
+
+    unique_keys_df = tr.loc[valid_date, ["_year", "date"]].copy()
+    unique_keys_df["_ticker"] = ticker_norm.loc[valid_date].to_numpy()
+    unique_keys_df = unique_keys_df.drop_duplicates(subset=["_year", "_ticker", "date"], keep="first")
+    unique_keys: list[tuple[str, str, pd.Timestamp]] = [
+        (str(y), str(t), d)
+        for y, t, d in zip(
+            unique_keys_df["_year"].to_numpy(dtype=object),
+            unique_keys_df["_ticker"].to_numpy(dtype=object),
+            unique_keys_df["date"].to_numpy(dtype=object),
+        )
+    ]
+
+    exit_min = tr[exit_time_col].map(_time_to_minutes_optional)
+    valid_exit = valid_date & exit_min.notna()
+    if valid_exit.any():
+        exit_df = pd.DataFrame(
+            {
+                "_ticker": ticker_norm.loc[valid_exit].to_numpy(dtype=object),
+                "date": tr.loc[valid_exit, "date"].to_numpy(dtype=object),
+                "_exit_min": exit_min.loc[valid_exit].to_numpy(dtype=np.int64, copy=False),
+            }
+        )
+        max_min = exit_df.groupby(["_ticker", "date"], sort=False)["_exit_min"].max()
+        max_exit_by_key: dict[tuple[str, pd.Timestamp], time] = {
+            (str(t), d): time(int(m) // 60, int(m) % 60)
+            for (t, d), m in max_min.items()
+        }
+    else:
+        max_exit_by_key = {}
 
     # Group by year for loading
     by_year: dict[str, list[tuple[str, pd.Timestamp]]] = {}
