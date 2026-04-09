@@ -2909,28 +2909,41 @@ def enrich_trades_post_backtest(
         return result
     tr["date"] = pd.to_datetime(tr[date_col], errors="coerce").dt.normalize()
 
-    # Collect unique (year, ticker, date) and max exit_time per (ticker, date)
-    year_from_date = tr["date"].dt.year.astype(str)
-    tr["_year"] = year_from_date
-    unique_keys: list[tuple[str, str, pd.Timestamp]] = []
-    seen = set()
-    max_exit_by_key: dict[tuple[str, pd.Timestamp], time] = {}
-    for _, row in tr.iterrows():
-        y = str(row["_year"])
-        t = str(row[ticker_col]).strip()
-        d = row["date"]
-        if pd.isna(d):
-            continue
-        key = (y, t, d)
-        if key not in seen:
-            seen.add(key)
-            unique_keys.append(key)
-        exit_t = _parse_time_str(row.get(exit_time_col))
-        if exit_t is not None:
-            k = (t, d)
-            cur = max_exit_by_key.get(k)
-            if cur is None or (exit_t.hour * 60 + exit_t.minute) > (cur.hour * 60 + cur.minute):
-                max_exit_by_key[k] = exit_t
+    # Collect unique (year, ticker, date) and max exit_time per (ticker, date).
+    # Vectorized path keeps first-seen order for unique_keys and avoids row-wise iterrows().
+    tr["_year"] = tr["date"].dt.year.astype(str)
+    ticker_norm = tr[ticker_col].astype(str).str.strip()
+    valid_date = tr["date"].notna()
+
+    unique_keys_df = tr.loc[valid_date, ["_year", "date"]].copy()
+    unique_keys_df["_ticker"] = ticker_norm.loc[valid_date].to_numpy()
+    unique_keys_df = unique_keys_df.drop_duplicates(subset=["_year", "_ticker", "date"], keep="first")
+    unique_keys: list[tuple[str, str, pd.Timestamp]] = [
+        (str(y), str(t), d)
+        for y, t, d in zip(
+            unique_keys_df["_year"].to_numpy(dtype=object),
+            unique_keys_df["_ticker"].to_numpy(dtype=object),
+            unique_keys_df["date"].to_numpy(dtype=object),
+        )
+    ]
+
+    exit_min = tr[exit_time_col].map(_time_to_minutes_optional)
+    valid_exit = valid_date & exit_min.notna()
+    if valid_exit.any():
+        exit_df = pd.DataFrame(
+            {
+                "_ticker": ticker_norm.loc[valid_exit].to_numpy(dtype=object),
+                "date": tr.loc[valid_exit, "date"].to_numpy(dtype=object),
+                "_exit_min": exit_min.loc[valid_exit].to_numpy(dtype=np.int64, copy=False),
+            }
+        )
+        max_min = exit_df.groupby(["_ticker", "date"], sort=False)["_exit_min"].max()
+        max_exit_by_key: dict[tuple[str, pd.Timestamp], time] = {
+            (str(t), d): time(int(m) // 60, int(m) % 60)
+            for (t, d), m in max_min.items()
+        }
+    else:
+        max_exit_by_key = {}
 
     # Group by year for loading
     by_year: dict[str, list[tuple[str, pd.Timestamp]]] = {}
