@@ -134,6 +134,7 @@ def _enrich_long_chunked_by_ticker(
         250_000,
         min_value=1,
     )
+    force_slice_copy = _env_bool("BT_PHASE2_ENRICH_FORCE_SLICE_COPY", default=False)
     batch_workers = _env_int_strict("BT_PHASE2_ENRICH_BATCH_WORKERS", 1, min_value=1)
     max_inflight_rows = _env_int_strict("BT_PHASE2_ENRICH_MAX_INFLIGHT_ROWS", 1_200_000, min_value=1)
     max_inflight_batches = _env_int_strict(
@@ -194,6 +195,8 @@ def _enrich_long_chunked_by_ticker(
     if batch_workers <= 1:
         for idx in batch_indices:
             sub = long_df.iloc[idx]
+            if force_slice_copy:
+                sub = sub.copy()
             enriched_sub = _enrich_long_quiet(sub)
             del sub
             if enriched_sub is not None and not enriched_sub.empty:
@@ -213,6 +216,8 @@ def _enrich_long_chunked_by_ticker(
                     if pending and (inflight_rows + rows_n) > max_inflight_rows:
                         break
                     sub = long_df.iloc[idx]
+                    if force_slice_copy:
+                        sub = sub.copy()
                     fut = ex.submit(_enrich_long_quiet_worker, sub)
                     del sub
                     pending.append((fut, rows_n))
