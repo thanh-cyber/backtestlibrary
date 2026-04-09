@@ -1144,6 +1144,8 @@ def _vectorized_entry_exit_elite_from_index(
     entry_price_s = _series_or_default("entry_price", np.nan)
     exit_price_s = _series_or_default("exit_price", np.nan)
     net_pnl_s = _series_or_default("net_pnl", 0.0)
+    gross_pnl_s = _series_or_default("gross_pnl", np.nan)
+    side_s = _series_or_default("side", None)
     shares_s = _series_or_default("shares", 0.0)
     initial_stop_s = _series_or_default("initial_stop", np.nan)
     stop_price_s = _series_or_default("stop_price", np.nan)
@@ -1155,6 +1157,8 @@ def _vectorized_entry_exit_elite_from_index(
     entry_price_arr = pd.to_numeric(entry_price_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
     exit_price_arr = pd.to_numeric(exit_price_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
     net_pnl_arr = pd.to_numeric(net_pnl_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    gross_pnl_arr = pd.to_numeric(gross_pnl_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    explicit_side_arr = side_s.astype(object).to_numpy(copy=False)
     shares_arr = pd.to_numeric(shares_s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
     stop_arr = pd.to_numeric(initial_stop_s.fillna(stop_price_s).fillna(initial_stop_legacy_s), errors="coerce").to_numpy(dtype=np.float64, copy=False)
     target_arr = pd.to_numeric(take_profit_s.fillna(target_price_s).fillna(take_profit_legacy_s), errors="coerce").to_numpy(dtype=np.float64, copy=False)
@@ -1230,8 +1234,10 @@ def _vectorized_entry_exit_elite_from_index(
             exit_price = exit_price_arr[p]
             net_pnl = net_pnl_arr[p] if np.isfinite(net_pnl_arr[p]) else 0.0
             shares_val = shares_arr[p] if np.isfinite(shares_arr[p]) else 0.0
-            gross_pnl_val = out.iloc[p].get("gross_pnl", np.nan)
-            explicit_side = out.iloc[p].get("side", None)
+            gross_pnl_val = gross_pnl_arr[p] if np.isfinite(gross_pnl_arr[p]) else np.nan
+            explicit_side = explicit_side_arr[p]
+            if explicit_side is not None and pd.isna(explicit_side):
+                explicit_side = None
             side = _infer_trade_side_from_values(
                 explicit_side=explicit_side,
                 shares=shares_val,
@@ -1285,9 +1291,8 @@ def _vectorized_entry_exit_elite_from_index(
                 tdict[f"Exit_Col_PathEligible_{w}m"] = 1.0 if ok_w else 0.0
                 if not ok_w:
                     continue
-                tmp_metrics = tdict
                 for mk in extra_metric_keys:
-                    tdict[f"{mk}_{w}m"] = tmp_metrics.get(mk, np.nan)
+                    tdict[f"{mk}_{w}m"] = tdict.get(mk, np.nan)
             skip_k = {entry_time_col, exit_time_col, ticker_col, dc}
             for k_elite, v_elite in tdict.items():
                 if k_elite in skip_k:
@@ -2611,22 +2616,12 @@ def _run_phase2_continuous_tracking(
                     )
                     if day_slice is None or day_slice.empty or "datetime" not in day_slice.columns:
                         continue
-                    day_dt = pd.to_datetime(day_slice["datetime"], errors="coerce")
-                    bar_mins = (
-                        day_dt.dt.hour.to_numpy(dtype=np.int64, copy=False) * 60
-                        + day_dt.dt.minute.to_numpy(dtype=np.int64, copy=False)
-                    )
-                    if bar_mins.size == 0:
-                        continue
-                    # day_slice is sorted by datetime from get_bars_slice; use binary bounds per trade.
-                    left = np.searchsorted(bar_mins, e_arr, side="left")
-                    right = np.searchsorted(bar_mins, x_arr, side="right")
-                    for l_i, r_i in zip(left, right):
-                        if int(r_i) <= int(l_i):
-                            continue
-                        sl = day_slice.iloc[int(l_i) : int(r_i)]
-                        if not sl.empty:
-                            slices_cc.append(sl)
+                    # Performance optimization: append one bounded (ticker, date) slice
+                    # per group rather than many per-trade sub-slices. The downstream
+                    # continuous tracker re-applies exact entry/exit boundaries per trade,
+                    # so providing a superset [min(entry), max(exit)] path preserves
+                    # correctness while reducing Python-loop and concat overhead.
+                    slices_cc.append(day_slice)
 
         el_cc = pd.concat(slices_cc, ignore_index=True) if slices_cc else pd.DataFrame()
         el_cc = _ensure_naive_datetime_column(el_cc)
