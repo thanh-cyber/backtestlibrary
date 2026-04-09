@@ -13,9 +13,9 @@ from __future__ import annotations
 import os
 import re
 from functools import lru_cache
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -71,6 +71,37 @@ def _normalize_time_str(t_str: str) -> str:
     h = int(parts[0])
     mm = int(parts[1]) if len(parts) > 1 else 0
     return f"{h}:{mm:02d}"
+
+
+def _time_str_to_bar_minutes(t_str: str) -> Optional[int]:
+    """Minutes from midnight for a bare time column label like '9:30' or '09:30'."""
+    s = str(t_str).strip()
+    if not _TIME_COL_RE.match(s):
+        return None
+    parts = s.split(":")
+    h = int(parts[0])
+    mm = int(parts[1]) if len(parts) > 1 else 0
+    return h * 60 + mm
+
+
+def _session_minute_predicate(
+    melt_session_start: Optional[time],
+    melt_session_end: Optional[time],
+) -> Callable[[Optional[int]], bool]:
+    """Inclusive bar-minute filter; both bounds None => keep all."""
+    if melt_session_start is None or melt_session_end is None:
+        return lambda m: True
+    lo = melt_session_start.hour * 60 + melt_session_start.minute
+    hi = melt_session_end.hour * 60 + melt_session_end.minute
+
+    def _ok(m: Optional[int]) -> bool:
+        if m is None:
+            return False
+        if lo <= hi:
+            return lo <= m <= hi
+        return m >= lo or m <= hi
+
+    return _ok
 
 
 @lru_cache(maxsize=1024)
@@ -186,46 +217,21 @@ def _attach_yfinance_context(long_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def wide_to_long(
-    wide_df: pd.DataFrame,
-    *,
-    ticker_col: str = "Ticker",
-    date_col: str = "Date",
+def _wide_to_long_from_work(
+    work: pd.DataFrame,
+    tc: str,
+    date_col: str,
+    value_vars: list[str],
+    vol_map: dict[str, str],
+    open_map: dict[str, str],
+    high_map: dict[str, str],
+    low_map: dict[str, str],
 ) -> pd.DataFrame:
-    """
-    Convert wide backtest DataFrame to long (one row per ticker/date/time).
+    """Melt one wide slice (already date-normalized) to long; unsorted rows."""
+    empty_cols = ["Ticker", date_col, "datetime", "open", "high", "low", "close", "volume"]
+    if work.empty or not value_vars:
+        return pd.DataFrame(columns=empty_cols)
 
-    Wide: one row per (Date, Ticker), columns "9:30", "9:31", ... for price,
-    optional "Vol 9:30", ... for volume.
-    Long: Ticker, Date, datetime, open, high, low, close, volume.
-    If only one price column per time, open=high=low=close.
-
-    Uses vectorized melt instead of iterrows for speed.
-    """
-    if wide_df.empty or date_col not in wide_df.columns:
-        return pd.DataFrame()
-    tc = ticker_col if ticker_col in wide_df.columns else ("ticker" if "ticker" in wide_df.columns else None)
-    if tc is None:
-        return pd.DataFrame()
-
-    time_cols = _extract_time_columns(wide_df.columns.tolist())
-    if not time_cols:
-        return pd.DataFrame()
-
-    cols_all = wide_df.columns.tolist()
-    vol_map = _extract_volume_time_map(cols_all)
-    open_map = _extract_prefixed_time_map(cols_all, "Open")
-    high_map = _extract_prefixed_time_map(cols_all, "High")
-    low_map = _extract_prefixed_time_map(cols_all, "Low")
-    value_vars = [c for c in time_cols if c in wide_df.columns]
-    if not value_vars:
-        return pd.DataFrame()
-
-    work = wide_df.dropna(subset=[date_col]).copy()
-    work[date_col] = pd.to_datetime(work[date_col], errors="coerce").dt.normalize()
-    work = work[work[date_col].notna()]
-
-    # Melt price columns (vectorized)
     price_melt = work.melt(
         id_vars=[tc, date_col],
         value_vars=value_vars,
@@ -236,17 +242,13 @@ def wide_to_long(
     price_melt = price_melt[price_melt["close"].notna() & (price_melt["close"] > 0)]
 
     if price_melt.empty:
-        return pd.DataFrame(
-            columns=["Ticker", date_col, "datetime", "open", "high", "low", "close", "volume"]
-        )
+        return pd.DataFrame(columns=empty_cols)
 
-    # Build normalized time key on price melt once.
     t_parts = price_melt["time_str"].astype(str).str.split(":", expand=True)
     t_h = pd.to_numeric(t_parts[0], errors="coerce").fillna(0).astype("int64")
     t_mm = pd.to_numeric(t_parts[1], errors="coerce").fillna(0).astype("int64")
     price_melt["time_key"] = t_h.astype(str) + ":" + t_mm.astype(str).str.zfill(2)
 
-    # Merge volume (vectorized) if we have vol columns
     vol_cols = [c for c in vol_map.values() if c in work.columns]
     if vol_cols:
         vol_reverse = {v: _normalize_time_str(k) for k, v in vol_map.items()}
@@ -270,7 +272,6 @@ def wide_to_long(
     merged["volume"] = pd.to_numeric(merged["volume"], errors="coerce").fillna(1.0)
     merged.loc[merged["volume"] < 0, "volume"] = 1.0
 
-    # Merge Open/High/Low minute columns when present; fallback to close.
     def _merge_prefixed(base: pd.DataFrame, pmap: dict[str, str], out_name: str) -> pd.DataFrame:
         pcols = [c for c in pmap.values() if c in work.columns]
         if not pcols:
@@ -294,17 +295,158 @@ def wide_to_long(
     merged = _merge_prefixed(merged, high_map, "high")
     merged = _merge_prefixed(merged, low_map, "low")
 
-    # Parse time_str -> datetime (vectorized)
     parts = merged["time_str"].astype(str).str.split(":", expand=True)
     h = pd.to_numeric(parts[0], errors="coerce").fillna(0).astype("int64")
     mm = pd.to_numeric(parts[1], errors="coerce").fillna(0).astype("int64")
     merged["datetime"] = merged[date_col] + pd.to_timedelta(h * 60 + mm, unit="m")
 
-    # Output uses "Ticker" (normalized to upper) for engine compatibility
     merged["Ticker"] = merged[tc].astype(str).str.upper()
-    out = merged[["Ticker", date_col, "datetime", "open", "high", "low", "close", "volume"]]
-    out = out.sort_values(["Ticker", "datetime"]).reset_index(drop=True)
-    return out
+    return merged[["Ticker", date_col, "datetime", "open", "high", "low", "close", "volume"]]
+
+
+def wide_to_long(
+    wide_df: pd.DataFrame,
+    *,
+    ticker_col: str = "Ticker",
+    date_col: str = "Date",
+    melt_session_start: Optional[time] = None,
+    melt_session_end: Optional[time] = None,
+    ticker_melt_workers: Optional[int] = None,
+    after_each_ticker: Optional[Callable[[], None]] = None,
+) -> pd.DataFrame:
+    """
+    Convert wide backtest DataFrame to long (one row per ticker/date/time).
+
+    Wide: one row per (Date, Ticker), columns "9:30", "9:31", ... for price,
+    optional "Vol 9:30", ... for volume.
+    Long: Ticker, Date, datetime, open, high, low, close, volume.
+    If only one price column per time, open=high=low=close.
+
+    Uses vectorized melt instead of iterrows for speed.
+
+    When ``melt_session_start`` and ``melt_session_end`` are set, only minute columns
+    whose bar time falls in that inclusive window are melted (faster when the wide
+    file spans more than the backtest session, e.g. PM-only runs on full-day cache).
+
+    Parallel melt: ``ticker_melt_workers`` > 1 or env ``BT_WIDE_TO_LONG_TICKER_WORKERS``.
+    Used only when average rows per ticker is high (see env
+    ``BT_WIDE_TO_LONG_PARALLEL_MIN_AVG_ROWS``); otherwise one vectorized melt is faster
+    (many small per-ticker melts + GIL ≪ single melt on the full frame).
+
+    When ``after_each_ticker`` is set, always melts one ticker at a time and invokes
+    the callback after each (for progress bars); skips threaded parallel melt.
+    """
+    if wide_df.empty or date_col not in wide_df.columns:
+        return pd.DataFrame()
+    tc = ticker_col if ticker_col in wide_df.columns else ("ticker" if "ticker" in wide_df.columns else None)
+    if tc is None:
+        return pd.DataFrame()
+
+    _keep_m = _session_minute_predicate(melt_session_start, melt_session_end)
+
+    time_cols = _extract_time_columns(wide_df.columns.tolist())
+    if not time_cols:
+        return pd.DataFrame()
+
+    cols_all = wide_df.columns.tolist()
+    vol_map = _extract_volume_time_map(cols_all)
+    open_map = _extract_prefixed_time_map(cols_all, "Open")
+    high_map = _extract_prefixed_time_map(cols_all, "High")
+    low_map = _extract_prefixed_time_map(cols_all, "Low")
+    if melt_session_start is not None and melt_session_end is not None:
+        vol_map = {k: v for k, v in vol_map.items() if _keep_m(_time_str_to_bar_minutes(k))}
+        open_map = {k: v for k, v in open_map.items() if _keep_m(_time_str_to_bar_minutes(k))}
+        high_map = {k: v for k, v in high_map.items() if _keep_m(_time_str_to_bar_minutes(k))}
+        low_map = {k: v for k, v in low_map.items() if _keep_m(_time_str_to_bar_minutes(k))}
+
+    value_vars = [c for c in time_cols if c in wide_df.columns]
+    if melt_session_start is not None and melt_session_end is not None:
+        value_vars = [c for c in value_vars if _keep_m(_time_str_to_bar_minutes(c))]
+    if not value_vars:
+        return pd.DataFrame()
+
+    work = wide_df.dropna(subset=[date_col]).copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce").dt.normalize()
+    work = work[work[date_col].notna()]
+
+    tw = ticker_melt_workers
+    if tw is None:
+        try:
+            tw = int(os.getenv("BT_WIDE_TO_LONG_TICKER_WORKERS", "1"))
+        except ValueError:
+            tw = 1
+    tw = max(1, min(int(tw), 32))
+    n_sym = int(work[tc].nunique(dropna=True))
+    try:
+        _min_avg = int(os.getenv("BT_WIDE_TO_LONG_PARALLEL_MIN_AVG_ROWS", "80"))
+    except ValueError:
+        _min_avg = 80
+    _min_avg = max(1, _min_avg)
+    _avg_rows = (len(work) / n_sym) if n_sym else 0.0
+    # Many tickers × few rows each: threaded melts are far slower than one melt.
+    use_ticker_parallel = tw > 1 and n_sym > 1 and len(work) >= _min_avg * 2 and _avg_rows >= float(_min_avg)
+
+    out: pd.DataFrame
+    if after_each_ticker is not None:
+        parts_cb: list[pd.DataFrame] = []
+        for _tk, w in work.groupby(tc, sort=False):
+            if w.empty:
+                after_each_ticker()
+                continue
+            parts_cb.append(
+                _wide_to_long_from_work(
+                    w,
+                    tc,
+                    date_col,
+                    value_vars,
+                    vol_map,
+                    open_map,
+                    high_map,
+                    low_map,
+                )
+            )
+            after_each_ticker()
+        parts_cb = [p for p in parts_cb if p is not None and not p.empty]
+        if not parts_cb:
+            return pd.DataFrame(
+                columns=["Ticker", date_col, "datetime", "open", "high", "low", "close", "volume"]
+            )
+        out = pd.concat(parts_cb, ignore_index=True)
+    elif use_ticker_parallel:
+        groups = list(work.groupby(tc, sort=False))
+        pool = min(tw, len(groups))
+        with ThreadPoolExecutor(max_workers=pool) as ex:
+            futs = [
+                ex.submit(
+                    _wide_to_long_from_work,
+                    w,
+                    tc,
+                    date_col,
+                    value_vars,
+                    vol_map,
+                    open_map,
+                    high_map,
+                    low_map,
+                )
+                for _tk, w in groups
+            ]
+            parts = [fu.result() for fu in futs]
+        parts = [p for p in parts if p is not None and not p.empty]
+        if not parts:
+            return pd.DataFrame(
+                columns=["Ticker", date_col, "datetime", "open", "high", "low", "close", "volume"]
+            )
+        out = pd.concat(parts, ignore_index=True)
+    else:
+        out = _wide_to_long_from_work(
+            work, tc, date_col, value_vars, vol_map, open_map, high_map, low_map
+        )
+
+    if out.empty:
+        return pd.DataFrame(
+            columns=["Ticker", date_col, "datetime", "open", "high", "low", "close", "volume"]
+        )
+    return out.sort_values(["Ticker", "datetime"]).reset_index(drop=True)
 
 
 def enrich_long_with_library_columns(long_df: pd.DataFrame) -> pd.DataFrame:

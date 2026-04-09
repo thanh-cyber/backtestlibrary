@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import warnings
 from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -136,20 +137,28 @@ def _enrich_long_chunked_by_ticker(
         min_value=1,
     )
 
-    tser = long_df[ticker_col].astype(str).str.strip()
-    tickers = [t for t in tser.dropna().drop_duplicates().tolist() if t]
+    # Build a clean ticker series first, then derive *positional* row indices.
+    # Using label-index groups here can break `.iloc[...]` when long_df index
+    # is not a 0..N-1 RangeIndex.
+    tser = long_df[ticker_col].astype("string").str.strip()
+    valid_ticker = tser.notna() & (tser != "")
+    tickers = [str(t) for t in tser[valid_ticker].drop_duplicates().tolist()]
     if not tickers:
         return _enrich_long_quiet(long_df)
 
-    # Cache row-index membership once (avoid repeated full-frame isin scans).
-    row_pos = pd.Series(np.arange(len(long_df), dtype=np.int64), index=long_df.index)
-    group_pos = row_pos.groupby(tser, sort=False).groups
-    idx_map: dict[str, np.ndarray] = {}
-    for t in tickers:
-        gp = group_pos.get(t)
-        if gp is None:
+    # Cache positional membership once (avoid repeated full-frame scans).
+    idx_lists: dict[str, list[int]] = {}
+    for pos, t in enumerate(tser.to_numpy(dtype=object, na_value=None)):
+        if t is None or t == "":
             continue
-        idx_map[t] = np.asarray(gp, dtype=np.int64)
+        ts = str(t)
+        idx_lists.setdefault(ts, []).append(pos)
+
+    idx_map: dict[str, np.ndarray] = {
+        t: np.asarray(pos_list, dtype=np.int64)
+        for t, pos_list in idx_lists.items()
+        if pos_list
+    }
 
     batch_indices: list[np.ndarray] = []
     for i in range(0, len(tickers), batch_tickers):
@@ -1351,8 +1360,10 @@ def _incremental_rehydrate_spooled_chunks(
     work_dir: Path,
 ) -> pd.DataFrame:
     """
-    Incrementally merge spooled chunks in bounded windows to avoid one giant concat spike.
+    Incrementally rehydrate spooled chunks in bounded windows.
+    Reads each spool parquet exactly once, avoids merge-window parquet rewrite/re-read.
     """
+    del work_dir  # retained in signature for compatibility
     if not chunk_files:
         return pd.DataFrame()
     try:
@@ -1361,20 +1372,16 @@ def _incremental_rehydrate_spooled_chunks(
         merge_window = 24
     merge_window = max(1, merge_window)
     ordered = sorted(chunk_files, key=lambda p: p.name)
-    merged_window_files: list[Path] = []
+    window_frames: list[pd.DataFrame] = []
     for i in range(0, len(ordered), merge_window):
         block = ordered[i : i + merge_window]
         parts = [pd.read_parquet(str(pf), engine="pyarrow") for pf in block]
         merged = pd.concat(parts, ignore_index=True)
         if "_orig_idx" in merged.columns:
             merged = merged.sort_values("_orig_idx")
-        out_file = work_dir / f"merged_window_{i // merge_window:06d}.parquet"
-        merged.to_parquet(out_file, index=False, engine="pyarrow")
-        merged_window_files.append(out_file)
+        window_frames.append(merged)
         del parts
-        del merged
-    final_parts = [pd.read_parquet(str(pf), engine="pyarrow") for pf in merged_window_files]
-    final_df = pd.concat(final_parts, ignore_index=True)
+    final_df = pd.concat(window_frames, ignore_index=True) if len(window_frames) > 1 else window_frames[0]
     if "_orig_idx" in final_df.columns:
         final_df = final_df.sort_values("_orig_idx")
     return final_df
@@ -1707,6 +1714,11 @@ def _build_enriched_long_for_chunk(
     cache_path_obj: Optional[Path] = None,
     base_cache_key: Optional[str] = None,
     chunk_start_idx: int = 0,
+    wide_tick_progress: Optional[Callable[[], None]] = None,
+    wide_pbar_granular: bool = False,
+    wide_tick_batch_after_melt: int = 0,
+    phase2_pbar_wide: Any = None,
+    phase2_pbar_lock: Optional[threading.Lock] = None,
 ) -> Optional[pd.DataFrame]:
     """
     Build enriched long for one date chunk only. Optionally write to cache as .../base_cache_key_chunk{i}.parquet.
@@ -1719,15 +1731,42 @@ def _build_enriched_long_for_chunk(
         cols = _get_enrich_columns_for_year_static(
             year, cleaned_year_data, wide_path_by_year, load_full_columns=load_full_columns
         )
+    _phase2_pbar_safe_set_postfix_str(
+        phase2_pbar_wide, phase2_pbar_lock, "reading parquet (no tickers yet)"
+    )
     wide_df = _load_wide_for_dates(
         year, chunk_dates, tickers, cleaned_year_data, wide_path_by_year, columns=cols
     )
     if wide_df is None or wide_df.empty:
+        _phase2_pbar_safe_set_postfix_str(phase2_pbar_wide, phase2_pbar_lock, "")
         return None
-    long_df = wide_to_long(wide_df, ticker_col="Ticker", date_col="Date")
+    _phase2_pbar_safe_set_postfix_str(
+        phase2_pbar_wide,
+        phase2_pbar_lock,
+        "melting wide→long (per-ticker)..."
+        if wide_pbar_granular
+        else "melting wide→long (vectorized)...",
+    )
+    _melt_cb = wide_tick_progress if wide_pbar_granular else None
+    long_df = wide_to_long(
+        wide_df,
+        ticker_col="Ticker",
+        date_col="Date",
+        melt_session_start=session_start,
+        melt_session_end=end_time,
+        after_each_ticker=_melt_cb,
+    )
+    _phase2_pbar_safe_set_postfix_str(phase2_pbar_wide, phase2_pbar_lock, "")
     del wide_df
     if long_df.empty:
         return None
+    if (
+        not wide_pbar_granular
+        and wide_tick_progress is not None
+        and wide_tick_batch_after_melt > 0
+    ):
+        for _ in range(int(wide_tick_batch_after_melt)):
+            wide_tick_progress()
     rename_map = {c: c.capitalize() for c in ["open", "high", "low", "close", "volume"] if c in long_df.columns}
     if rename_map:
         long_df = long_df.rename(columns=rename_map)
@@ -1786,7 +1825,13 @@ def _build_enriched_long_for_year(args: tuple) -> tuple[str, list[pd.DataFrame]]
         )
         if wide_df is None or wide_df.empty:
             continue
-        long_df = wide_to_long(wide_df, ticker_col="Ticker", date_col="Date")
+        long_df = wide_to_long(
+            wide_df,
+            ticker_col="Ticker",
+            date_col="Date",
+            melt_session_start=session_start,
+            melt_session_end=end_time,
+        )
         del wide_df
         if long_df.empty:
             continue
@@ -1809,6 +1854,75 @@ def _build_enriched_long_for_year(args: tuple) -> tuple[str, list[pd.DataFrame]]
         cache_path_obj.mkdir(parents=True, exist_ok=True)
         pd.concat(year_parts, ignore_index=True).to_parquet(cache_file, index=False, engine="pyarrow")
     return (year, year_parts)
+
+
+def _trade_chunk_unique_ticker_count(tr_df: pd.DataFrame, ticker_col: str) -> int:
+    """Distinct trade tickers in a chunk slice (for wide→long bar steps vs cache hits)."""
+    if tr_df.empty or ticker_col not in tr_df.columns:
+        return 0
+    return int(tr_df[ticker_col].nunique(dropna=True))
+
+
+def _trade_chunk_ticker_day_count(tr_df: pd.DataFrame, ticker_col: str) -> int:
+    """Unique (ticker, calendar date) rows in a trade slice; matches Phase 2 bar units."""
+    if tr_df.empty or ticker_col not in tr_df.columns or "date" not in tr_df.columns:
+        return 0
+    t = tr_df[ticker_col].astype(str).str.strip().str.upper()
+    d = pd.to_datetime(tr_df["date"], errors="coerce").dt.normalize()
+    m = t.ne("") & d.notna()
+    if not m.any():
+        return 0
+    sub = pd.DataFrame({"_t": t[m], "_d": d[m]})
+    return int(sub.drop_duplicates().shape[0])
+
+
+def _phase2_pbar_safe_update(pbar: Any, lock: Optional[threading.Lock], n: int) -> None:
+    if pbar is None or n <= 0:
+        return
+    if lock is not None:
+        with lock:
+            pbar.update(n)
+    else:
+        pbar.update(n)
+
+
+def _phase2_pbar_safe_set_postfix_str(
+    pbar: Any, lock: Optional[threading.Lock], text: str
+) -> None:
+    if pbar is None:
+        return
+    if lock is not None:
+        with lock:
+            pbar.set_postfix_str(text, refresh=True)
+    else:
+        pbar.set_postfix_str(text, refresh=True)
+
+
+def _phase2_chunk_tasks_for_year(
+    tr_year: pd.DataFrame,
+    dates: list,
+    CHUNK_DAYS: int,
+) -> list[tuple[int, list, pd.DataFrame]]:
+    """Build date-chunk trade slices for one year (matches ``enrich_trades_post_backtest`` chunking)."""
+    if tr_year.empty or not dates:
+        return []
+    tr_year_dates_norm = tr_year["date"].dt.normalize()
+    tr_year_by_date = {
+        pd.Timestamp(d).normalize(): g
+        for d, g in tr_year.groupby(tr_year_dates_norm, sort=False)
+    }
+    chunk_tasks: list[tuple[int, list, pd.DataFrame]] = []
+    for chunk_start in range(0, len(dates), CHUNK_DAYS):
+        chunk_dates = dates[chunk_start : chunk_start + CHUNK_DAYS]
+        if not chunk_dates:
+            continue
+        chunk_dates_norm = [pd.Timestamp(d).normalize() for d in chunk_dates]
+        tr_parts = [tr_year_by_date[d] for d in chunk_dates_norm if d in tr_year_by_date]
+        tr_chunk = pd.concat(tr_parts, ignore_index=False) if tr_parts else pd.DataFrame()
+        if tr_chunk.empty:
+            continue
+        chunk_tasks.append((chunk_start, chunk_dates, tr_chunk.copy()))
+    return chunk_tasks
 
 
 def _split_trade_df_for_workers(tr_df: pd.DataFrame, n_workers: int) -> list[pd.DataFrame]:
@@ -2523,6 +2637,8 @@ def _enrich_trades_with_long(
     *,
     phase2_continuous: bool = True,
     timeline_step_seconds: int = 60,
+    get_bars_slice: Optional[Callable[[str, pd.Timestamp, time, time], Optional[pd.DataFrame]]] = None,
+    day_cache: Optional[dict[tuple[str, pd.Timestamp], dict[str, Any]]] = None,
 ) -> pd.DataFrame:
     """Apply Phase 2 enrichment for trade rows sharing one enriched_long (entry/exit; continuous if phase2_continuous)."""
     if tr_slice.empty:
@@ -2536,8 +2652,10 @@ def _enrich_trades_with_long(
             f"columns={cols!r}. Need {_EL_TICKER_COL!r} and {_EL_DATE_COL!r} or {_EL_DATETIME_COL!r}."
         )
 
-    get_bars_slice = _bars_slice_from_index(el_index)
-    day_cache = _build_day_cache_for_index(el_index)
+    if get_bars_slice is None:
+        get_bars_slice = _bars_slice_from_index(el_index)
+    if day_cache is None:
+        day_cache = _build_day_cache_for_index(el_index)
     enriched_trades_chunk = _vectorized_entry_exit_elite_from_index(
         tr_slice,
         el_index,
@@ -2587,10 +2705,22 @@ def _process_single_enrichment_chunk(
     inner_workers: int = 1,
     phase2_continuous: bool = True,
     timeline_step_seconds: int = 60,
+    phase2_pbar: Any = None,
+    phase2_pbar_wide: Any = None,
+    phase2_pbar_lock: Optional[threading.Lock] = None,
+    wide_tick_progress: Optional[Callable[[], None]] = None,
+    wide_pbar_granular: bool = False,
 ) -> tuple[int, pd.DataFrame]:
     """One date-chunk: load enriched long once, then optionally split trade rows across inner_workers threads."""
     enriched_long = None
+    got_long_from_cache = False
     if full_year_cached and cache_file_str:
+        _phase2_pbar_safe_set_postfix_str(
+            phase2_pbar_wide, phase2_pbar_lock, "reading enriched cache (date slice)..."
+        )
+        _phase2_pbar_safe_set_postfix_str(
+            phase2_pbar, phase2_pbar_lock, "waiting: load enriched long..."
+        )
         d_min, d_max = min(chunk_dates), max(chunk_dates)
         lo, hi = _bounds_for_parquet_date_column(cache_file_str, d_min, d_max)
         enriched_long = pd.read_parquet(
@@ -2598,11 +2728,24 @@ def _process_single_enrichment_chunk(
             filters=[("Date", ">=", lo), ("Date", "<=", hi)],
             engine="pyarrow",
         )
+        got_long_from_cache = enriched_long is not None and not enriched_long.empty
+        _phase2_pbar_safe_set_postfix_str(phase2_pbar_wide, phase2_pbar_lock, "")
+        _phase2_pbar_safe_set_postfix_str(phase2_pbar, phase2_pbar_lock, "")
     elif cache_path_obj is not None:
         chunk_file = cache_path_obj / f"{base_cache_key}_chunk{chunk_start}.parquet"
         if chunk_file.is_file():
+            _phase2_pbar_safe_set_postfix_str(
+                phase2_pbar_wide, phase2_pbar_lock, "reading enriched chunk parquet..."
+            )
+            _phase2_pbar_safe_set_postfix_str(
+                phase2_pbar, phase2_pbar_lock, "waiting: load enriched long..."
+            )
             enriched_long = pd.read_parquet(chunk_file, engine="pyarrow")
+            got_long_from_cache = enriched_long is not None and not enriched_long.empty
+            _phase2_pbar_safe_set_postfix_str(phase2_pbar_wide, phase2_pbar_lock, "")
+            _phase2_pbar_safe_set_postfix_str(phase2_pbar, phase2_pbar_lock, "")
     if enriched_long is None or enriched_long.empty:
+        got_long_from_cache = False
         enriched_long = _build_enriched_long_for_chunk(
             year,
             chunk_dates,
@@ -2616,16 +2759,39 @@ def _process_single_enrichment_chunk(
             cache_path_obj=cache_path_obj,
             base_cache_key=base_cache_key,
             chunk_start_idx=chunk_start,
+            wide_tick_progress=wide_tick_progress,
+            wide_pbar_granular=wide_pbar_granular,
+            wide_tick_batch_after_melt=_trade_chunk_unique_ticker_count(tr_chunk, ticker_col),
+            phase2_pbar_wide=phase2_pbar_wide,
+            phase2_pbar_lock=phase2_pbar_lock,
         )
+
+    if got_long_from_cache and phase2_pbar_wide is not None:
+        nt = _trade_chunk_unique_ticker_count(tr_chunk, ticker_col)
+        for _ in range(nt):
+            _phase2_pbar_safe_update(phase2_pbar_wide, phase2_pbar_lock, 1)
 
     if enriched_long is None or enriched_long.empty:
         unchunk = tr_chunk.drop(columns=["_year"], errors="ignore")
         if "_orig_idx" in tr_chunk.columns:
             unchunk = unchunk.copy()
             unchunk["_orig_idx"] = tr_chunk["_orig_idx"].values
+        _phase2_pbar_safe_update(
+            phase2_pbar,
+            phase2_pbar_lock,
+            _trade_chunk_ticker_day_count(tr_chunk, ticker_col),
+        )
         return chunk_start, unchunk
 
+    _phase2_pbar_safe_set_postfix_str(
+        phase2_pbar_wide, phase2_pbar_lock, "building (ticker,date) index..."
+    )
+    _phase2_pbar_safe_set_postfix_str(
+        phase2_pbar, phase2_pbar_lock, "building (ticker,date) index..."
+    )
     el_index = _build_enriched_long_index(enriched_long)
+    _phase2_pbar_safe_set_postfix_str(phase2_pbar_wide, phase2_pbar_lock, "")
+    _phase2_pbar_safe_set_postfix_str(phase2_pbar, phase2_pbar_lock, "")
     if not el_index:
         cols = list(enriched_long.columns)
         raise RuntimeError(
@@ -2635,13 +2801,22 @@ def _process_single_enrichment_chunk(
             f"Requires non-empty {_EL_TICKER_COL!r} and {_EL_DATE_COL!r} or {_EL_DATETIME_COL!r} on enriched long."
         )
 
+    if phase2_continuous and result is None:
+        raise RuntimeError("phase2_continuous=True requires RunResult for chunk enrichment.")
+
+    # Build shared helpers once per chunk, then reuse for each (ticker, date) group.
+    get_bars_slice = _bars_slice_from_index(el_index)
+    day_cache = _build_day_cache_for_index(el_index)
+
     iw = _safe_worker_int(inner_workers, default=1, cap=64)
-    batches = _split_trade_df_for_workers(tr_chunk, iw)
-    if len(batches) <= 1:
-        if phase2_continuous and result is None:
-            raise RuntimeError("phase2_continuous=True requires RunResult for chunk enrichment.")
-        chunk_result_df = _enrich_trades_with_long(
-            tr_chunk,
+    tw = max(1, int(timeline_step_seconds))
+    _tk = tr_chunk[ticker_col].astype(str).str.strip().str.upper()
+    _dt = pd.to_datetime(tr_chunk["date"], errors="coerce").dt.normalize()
+    groups = list(tr_chunk.groupby([_tk, _dt], sort=False))
+
+    def _one_td_group(g: pd.DataFrame) -> pd.DataFrame:
+        return _enrich_trades_with_long(
+            g,
             enriched_long,
             el_index,
             result,
@@ -2649,31 +2824,30 @@ def _process_single_enrichment_chunk(
             entry_time_col,
             exit_time_col,
             phase2_continuous=phase2_continuous,
-            timeline_step_seconds=timeline_step_seconds,
+            timeline_step_seconds=tw,
+            get_bars_slice=get_bars_slice,
+            day_cache=day_cache,
         )
+
+    parts_td: list[pd.DataFrame] = []
+    if not groups:
+        chunk_result_df = pd.DataFrame()
+    elif iw <= 1 or len(groups) == 1:
+        for (_, _), g in groups:
+            parts_td.append(_one_td_group(g))
+            _phase2_pbar_safe_update(phase2_pbar, phase2_pbar_lock, 1)
+        chunk_result_df = pd.concat(parts_td, ignore_index=True) if parts_td else pd.DataFrame()
     else:
-        pool = len(batches)
-        tw = max(1, int(timeline_step_seconds))
-
-        def _enrich_batch(batch: pd.DataFrame) -> pd.DataFrame:
-            if phase2_continuous and result is None:
-                raise RuntimeError("phase2_continuous=True requires RunResult for chunk enrichment.")
-            return _enrich_trades_with_long(
-                batch,
-                enriched_long,
-                el_index,
-                result,
-                ticker_col,
-                entry_time_col,
-                exit_time_col,
-                phase2_continuous=phase2_continuous,
-                timeline_step_seconds=tw,
-            )
-
+        pool = min(iw, len(groups))
         with ThreadPoolExecutor(max_workers=pool) as ex:
-            futs = [ex.submit(_enrich_batch, b) for b in batches]
-            parts = [f.result() for f in futs]
-        chunk_result_df = pd.concat(parts, ignore_index=True)
+            futs = [ex.submit(_one_td_group, g) for (_, _), g in groups]
+            for fut in as_completed(futs):
+                parts_td.append(fut.result())
+                _phase2_pbar_safe_update(phase2_pbar, phase2_pbar_lock, 1)
+        chunk_result_df = pd.concat(parts_td, ignore_index=True) if parts_td else pd.DataFrame()
+
+    if not chunk_result_df.empty and "_orig_idx" in chunk_result_df.columns:
+        chunk_result_df = chunk_result_df.sort_values("_orig_idx", kind="mergesort")
 
     return chunk_start, chunk_result_df
 
@@ -2703,8 +2877,12 @@ def enrich_trades_post_backtest(
     Continuous_*: ``_run_phase2_continuous_tracking`` when ``get_continuous_columns()`` is non-empty.
 
     chunk_workers: threads splitting **trade rows within one date-chunk** (after shared enriched_long
-    is built once for that chunk). Date-chunks run **one after another** (chunk 1, then chunk 2, …).
+    is built once for that chunk). Date-chunks may run in parallel when ``BT_PHASE2_CHUNK_TASK_WORKERS``>1.
     Final trade order is restored with _orig_idx across the full result.
+
+    ``BT_PHASE2_WIDE_PBAR_PER_TICKER``: if ``1``, the wide→long bar advances once per ticker by melting
+    one ticker at a time (accurate but **much** slower). Default ``0``: one vectorized melt per chunk;
+    the bar then jumps by that chunk's trade-ticker count (matches the tqdm total, fast).
 
     If cache_dir is set, enriched long DataFrames are saved per year (keyed by year + hash of
     date set) and reused on subsequent runs to skip wide_to_long + librarycolumn for that year.
@@ -2782,11 +2960,42 @@ def enrich_trades_post_backtest(
             tqdm = None
     tr["_orig_idx"] = np.arange(len(tr))
     total_ticker_days = int(sum(len(v) for v in by_year.values()))
-    pbar = (
-        tqdm(total=max(1, total_ticker_days), desc="Phase 2", unit="ticker-day")
+    year_to_chunk_tasks: dict[str, list[tuple[int, list, pd.DataFrame]]] = {}
+    for _y in sorted(by_year.keys()):
+        _td = by_year[_y]
+        _dates = sorted(set(d for _, d in _td))
+        _tr_y = tr[tr["_year"] == _y]
+        if _tr_y.empty:
+            year_to_chunk_tasks[_y] = []
+        else:
+            year_to_chunk_tasks[_y] = _phase2_chunk_tasks_for_year(_tr_y, _dates, CHUNK_DAYS)
+    wide_tick_total = 0
+    for _tasks in year_to_chunk_tasks.values():
+        for _cs, _cds, _trc in _tasks:
+            wide_tick_total += _trade_chunk_unique_ticker_count(_trc, ticker_col)
+    pbar_wide = (
+        tqdm(
+            total=max(1, wide_tick_total),
+            desc="Phase 2: wide→long",
+            unit="ticker",
+            position=0,
+            leave=True,
+        )
+        if (tqdm and show_progress and wide_tick_total > 0)
+        else None
+    )
+    pbar_attach = (
+        tqdm(
+            total=max(1, total_ticker_days),
+            desc="Phase 2: attach trades",
+            unit="ticker-day",
+            position=1 if pbar_wide is not None else 0,
+            leave=True,
+        )
         if (tqdm and show_progress)
         else None
     )
+    phase2_pbar_lock = threading.Lock() if (pbar_wide is not None or pbar_attach is not None) else None
     # Spool enriched chunk outputs to disk immediately to minimize peak RAM.
     spool_root = cache_path_obj if cache_path_obj is not None else Path(tempfile.gettempdir())
     phase2_spool_dir = Path(
@@ -2825,30 +3034,33 @@ def enrich_trades_post_backtest(
             tr_year = tr[tr["_year"] == year]
             if tr_year.empty:
                 continue
-            tr_year_dates_norm = tr_year["date"].dt.normalize()
 
-            chunk_tasks: list[tuple[int, list, pd.DataFrame]] = []
+            chunk_tasks = year_to_chunk_tasks.get(year, [])
             cache_file_str = str(cache_file) if cache_file is not None else None
-            for chunk_start in range(0, len(dates), CHUNK_DAYS):
-                chunk_dates = dates[chunk_start : chunk_start + CHUNK_DAYS]
-                if not chunk_dates:
-                    continue
-                chunk_dates_set = set(pd.Timestamp(d).normalize() for d in chunk_dates)
-                tr_chunk = tr_year[tr_year_dates_norm.isin(chunk_dates_set)]
-                if tr_chunk.empty:
-                    continue
-                chunk_tasks.append((chunk_start, chunk_dates, tr_chunk.copy()))
 
             cw = _safe_worker_int(chunk_workers, default=1, cap=64)
-            chunk_done_units: dict[int, int] = {}
-            for cs, cds, _tc in chunk_tasks:
-                cds_set = set(pd.Timestamp(d).normalize() for d in cds)
-                chunk_done_units[int(cs)] = sum(
-                    1 for (_tt, dd) in ticker_dates if pd.Timestamp(dd).normalize() in cds_set
-                )
 
-            for cs, cds, tc in chunk_tasks:
-                _, cdf = _process_single_enrichment_chunk(
+            tc_by_start: dict[int, pd.DataFrame] = {int(cs): tc for cs, _cds, tc in chunk_tasks}
+            try:
+                chunk_task_workers = int(os.getenv("BT_PHASE2_CHUNK_TASK_WORKERS", "1"))
+            except Exception:
+                chunk_task_workers = 1
+            chunk_task_workers = max(1, min(chunk_task_workers, len(chunk_tasks)))
+
+            try:
+                _wgran_raw = int(os.getenv("BT_PHASE2_WIDE_PBAR_PER_TICKER", "0"))
+            except ValueError:
+                _wgran_raw = 0
+            wide_pbar_granular = _wgran_raw != 0
+
+            def _wide_tick_step() -> None:
+                _phase2_pbar_safe_update(pbar_wide, phase2_pbar_lock, 1)
+
+            _wide_cb = _wide_tick_step if pbar_wide is not None else None
+
+            def _run_chunk_task(task: tuple[int, list, pd.DataFrame]) -> tuple[int, pd.DataFrame]:
+                cs, cds, tc = task
+                return _process_single_enrichment_chunk(
                     cs,
                     cds,
                     tc,
@@ -2871,7 +3083,17 @@ def enrich_trades_post_backtest(
                     inner_workers=cw,
                     phase2_continuous=phase2_continuous,
                     timeline_step_seconds=timeline_step_seconds_phase2,
+                    phase2_pbar=pbar_attach,
+                    phase2_pbar_wide=pbar_wide,
+                    phase2_pbar_lock=phase2_pbar_lock,
+                    wide_tick_progress=_wide_cb,
+                    wide_pbar_granular=wide_pbar_granular,
                 )
+
+            def _spool_one_chunk(cs: int, cdf: pd.DataFrame) -> None:
+                tc = tc_by_start.get(int(cs))
+                if tc is None:
+                    return
                 if "_orig_idx" not in cdf.columns and "_orig_idx" in tc.columns:
                     cdf = cdf.copy()
                     cdf["_orig_idx"] = tc["_orig_idx"].values
@@ -2882,8 +3104,19 @@ def enrich_trades_post_backtest(
                 cdf.to_parquet(spool_file, index=False, engine="pyarrow")
                 spooled_chunk_files.append(spool_file)
                 del cdf
-                if pbar is not None:
-                    pbar.update(int(chunk_done_units.get(int(cs), 0)))
+
+            # Spool + pbar after each chunk completes (smooth progress). Avoid batching all
+            # results then updating — that leaves the bar stuck until the whole year finishes.
+            if chunk_task_workers <= 1 or len(chunk_tasks) <= 1:
+                for task in chunk_tasks:
+                    cs, cdf = _run_chunk_task(task)
+                    _spool_one_chunk(cs, cdf)
+            else:
+                with ThreadPoolExecutor(max_workers=chunk_task_workers) as ex:
+                    fut_to_cs = {ex.submit(_run_chunk_task, t): int(t[0]) for t in chunk_tasks}
+                    for fut in as_completed(fut_to_cs):
+                        cs, cdf = fut.result()
+                        _spool_one_chunk(cs, cdf)
             # If no chunk produced output for this year, preserve rows via spooled fallback.
             if not any(str(p.name).startswith(f"{year}_chunk_") for p in spooled_chunk_files):
                 fallback_df = tr_year.drop(columns=["_year"], errors="ignore").copy()
@@ -2922,8 +3155,10 @@ def enrich_trades_post_backtest(
         )
         return result
     finally:
-        if pbar is not None:
-            pbar.close()
+        if pbar_attach is not None:
+            pbar_attach.close()
+        if pbar_wide is not None:
+            pbar_wide.close()
         try:
             if "phase2_spool_dir" in locals() and phase2_spool_dir.is_dir():
                 shutil.rmtree(phase2_spool_dir, ignore_errors=True)
