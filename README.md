@@ -130,4 +130,3 @@ config = BacktestConfig(..., timeline_step_seconds=300)  # 5 * 60
   `day_context` in `find_entries_for_day(..., day_context)` and
   `check_exit(..., day_context)` for additional speedups without changing fill
   realism.
-
