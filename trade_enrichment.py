@@ -135,6 +135,9 @@ def _enrich_long_chunked_by_ticker(
         min_value=1,
     )
     force_slice_copy = _env_bool("BT_PHASE2_ENRICH_FORCE_SLICE_COPY", default=False)
+    executor_mode = str(os.getenv("BT_PHASE2_ENRICH_EXECUTOR", "process")).strip().lower()
+    if executor_mode not in {"process", "thread"}:
+        raise RuntimeError("BT_PHASE2_ENRICH_EXECUTOR must be 'process' or 'thread'.")
     batch_workers = _env_int_strict("BT_PHASE2_ENRICH_BATCH_WORKERS", 1, min_value=1)
     max_inflight_rows = _env_int_strict("BT_PHASE2_ENRICH_MAX_INFLIGHT_ROWS", 1_200_000, min_value=1)
     max_inflight_batches = _env_int_strict(
@@ -206,7 +209,9 @@ def _enrich_long_chunked_by_ticker(
         pending: list[tuple[Any, int]] = []
         next_batch = 0
         inflight_rows = 0
-        with ProcessPoolExecutor(max_workers=batch_workers) as ex:
+        ex_cls = ThreadPoolExecutor if executor_mode == "thread" else ProcessPoolExecutor
+        submit_fn = _enrich_long_quiet if executor_mode == "thread" else _enrich_long_quiet_worker
+        with ex_cls(max_workers=batch_workers) as ex:
             while next_batch < len(batch_indices) or pending:
                 submitted_any = False
                 while next_batch < len(batch_indices) and len(pending) < max_inflight_batches:
@@ -218,7 +223,7 @@ def _enrich_long_chunked_by_ticker(
                     sub = long_df.iloc[idx]
                     if force_slice_copy:
                         sub = sub.copy()
-                    fut = ex.submit(_enrich_long_quiet_worker, sub)
+                    fut = ex.submit(submit_fn, sub)
                     del sub
                     pending.append((fut, rows_n))
                     inflight_rows += rows_n
