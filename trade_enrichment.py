@@ -129,6 +129,11 @@ def _enrich_long_chunked_by_ticker(
         return _enrich_long_quiet(long_df)
 
     batch_tickers = _env_int_strict("BT_PHASE2_ENRICH_TICKER_BATCH", 25, min_value=1)
+    target_rows_per_batch = _env_int_strict(
+        "BT_PHASE2_ENRICH_TARGET_ROWS_PER_BATCH",
+        250_000,
+        min_value=1,
+    )
     batch_workers = _env_int_strict("BT_PHASE2_ENRICH_BATCH_WORKERS", 1, min_value=1)
     max_inflight_rows = _env_int_strict("BT_PHASE2_ENRICH_MAX_INFLIGHT_ROWS", 1_200_000, min_value=1)
     max_inflight_batches = _env_int_strict(
@@ -165,11 +170,20 @@ def _enrich_long_chunked_by_ticker(
     ]
 
     batch_indices: list[np.ndarray] = []
-    for i in range(0, len(grouped_pos), batch_tickers):
-        idx_parts = grouped_pos[i : i + batch_tickers]
-        if not idx_parts:
+    cur_parts: list[np.ndarray] = []
+    cur_rows = 0
+    for pos_arr in grouped_pos:
+        cur_parts.append(pos_arr)
+        cur_rows += int(len(pos_arr))
+        if len(cur_parts) < batch_tickers and cur_rows < target_rows_per_batch:
             continue
-        idx = np.concatenate(idx_parts).astype(np.int64, copy=False)
+        idx = np.concatenate(cur_parts).astype(np.int64, copy=False)
+        idx.sort()
+        batch_indices.append(idx)
+        cur_parts = []
+        cur_rows = 0
+    if cur_parts:
+        idx = np.concatenate(cur_parts).astype(np.int64, copy=False)
         idx.sort()
         batch_indices.append(idx)
 
